@@ -634,6 +634,19 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         if not isinstance(self._save_decode_cache, bool):
             raise ValueError("lmcache.mp.save_decode_cache must be a boolean")
 
+        # The DSV4.1 layerwise execution mode is implemented by the dedicated
+        # LMCache-Ascend connector; this stock connector would silently
+        # ignore the flag, so refuse to start instead of half-enabling it.
+        # Subclasses (the dedicated connector) are exempt: they parse and
+        # honor the flag themselves and must stay constructible.
+        if type(self) is LMCacheMPConnector and vllm_config.kv_transfer_config.get_from_extra_config(
+            "dsv41.layerwise", False
+        ):
+            raise ValueError(
+                "dsv41.layerwise is only honored by the DSV41LayerwiseMPConnector "
+                "(lmcache-ascend); unset the flag or select that connector"
+            )
+
         self._enable_kv_events = bool(
             getattr(vllm_config, "kv_events_config", None) is not None
             and vllm_config.kv_events_config.enable_kv_cache_events
@@ -750,7 +763,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             # Banner from the scheduler role only, so tensor-parallel
             # deployments print it once rather than once per worker.
             print_banner_once(sys.stderr)
-            self.scheduler_adapter = LMCacheMPSchedulerAdapter(
+            self.scheduler_adapter = self.create_lmcache_mp_scheduler_adapter(
                 server_urls=server_urls,
                 context=zmq_context,
                 model_name=cache_model_name,
@@ -879,6 +892,16 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         arguments are those of :class:`LMCacheMPWorkerAdapter`.
         """
         return LMCacheMPWorkerAdapter(**adapter_kwargs)
+
+    def create_lmcache_mp_scheduler_adapter(
+        self, **adapter_kwargs: Any
+    ) -> LMCacheMPSchedulerAdapter:
+        """Build the scheduler adapter.
+
+        Subclasses override this to use their own adapter. The keyword
+        arguments are those of :class:`LMCacheMPSchedulerAdapter`.
+        """
+        return LMCacheMPSchedulerAdapter(**adapter_kwargs)
 
     def _get_connector_metadata(self) -> KVConnectorMetadata:
         """Get the connector metadata.
