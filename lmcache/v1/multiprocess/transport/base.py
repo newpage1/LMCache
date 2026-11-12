@@ -23,6 +23,15 @@ from lmcache.v1.multiprocess.custom_types import (
 )
 from lmcache.v1.multiprocess.futures import MessagingFuture, MessagingStream
 from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+from lmcache.v1.multiprocess.layerwise_protocol import (
+    LayerwiseLookupRequest,
+    LayerwiseLookupResult,
+    LayerwiseRegistration,
+    LayerwiseRegistrationAck,
+    LayerwiseSnapshotCommit,
+    ResourceTransferResult,
+    ResourceTransferSpec,
+)
 from lmcache.v1.multiprocess.protocols.server_module import (
     ServerModuleCallRequest,
     ServerModuleCallResponse,
@@ -282,6 +291,34 @@ class RequestClient(Protocol):
         instance_id: int,
         event_ipc_handle: bytes,
     ) -> MessagingFuture[tuple[bytes, bool]]: ...
+
+    @rpc_method
+    def register_layerwise_cache(
+        self, registration: LayerwiseRegistration
+    ) -> MessagingFuture[LayerwiseRegistrationAck]: ...
+
+    @rpc_method
+    def lookup_layerwise_prefix(
+        self, request: LayerwiseLookupRequest
+    ) -> MessagingFuture[LayerwiseLookupResult | None]: ...
+
+    @rpc_method
+    def store_resource(
+        self, spec: ResourceTransferSpec, payload: bytes
+    ) -> MessagingFuture[ResourceTransferResult]: ...
+
+    @rpc_method
+    def retrieve_resource(
+        self, spec: ResourceTransferSpec
+    ) -> MessagingFuture[tuple[ResourceTransferResult, bytes]]: ...
+
+    @rpc_method
+    def commit_layerwise_snapshot(
+        self, commit: LayerwiseSnapshotCommit
+    ) -> MessagingFuture[bool]: ...
+
+    @rpc_method
+    def release_layerwise_lease(self, lease_id: str) -> MessagingFuture[bool]: ...
 
     def close(self) -> None:
         """Close the client and release its transport resources."""
