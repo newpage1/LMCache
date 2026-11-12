@@ -24,7 +24,16 @@ LAYERWISE_PROTOCOL_VERSION = 1
 """Bump on any breaking wire change; both ends must agree on it."""
 
 BOUNDARY_STATE_SCHEMA_VERSION = 1
-"""Schema version of :class:`BoundaryStateDescriptor` payloads."""
+"""Legacy schema version of :class:`BoundaryStateDescriptor` payloads."""
+
+BOUNDARY_STATE_SCHEMA_V2 = 2
+"""Full-page boundary schema (T85-02).
+
+A v2 descriptor additionally carries the ring geometry the captured
+page came from (``ring_length`` / ``page_offset``) plus the page-local
+``written_rows`` the engine actually wrote, so a restore can verify
+ring integrity end-to-end before rebasing onto a new request page.
+"""
 
 #: Compression phases a boundary snapshot may record. ``0`` is the row
 #: payload written at the boundary token; ``1`` is the residual carry that
@@ -140,6 +149,11 @@ class BoundaryStateDescriptor(msgspec.Struct, frozen=True, forbid_unknown_fields
     row_indices: tuple[int, ...]
     schema_version: int
     checksum: str
+    #: V2 ring-geometry fields (default = absent, i.e. a v1 descriptor).
+    #: See :data:`BOUNDARY_STATE_SCHEMA_V2`.
+    ring_length: int = -1
+    page_offset: int = -1
+    written_rows: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.snapshot_id:
@@ -158,6 +172,49 @@ class BoundaryStateDescriptor(msgspec.Struct, frozen=True, forbid_unknown_fields
             raise ValueError("row_indices must be nonnegative")
         if len(set(self.row_indices)) != len(self.row_indices):
             raise ValueError("row_indices must not repeat")
+        if self.schema_version == BOUNDARY_STATE_SCHEMA_V2:
+            # V2 full-page identity: the rows must span exactly one ring
+            # page and the written rows must be real page-local slots.
+            if self.ring_length <= 0:
+                raise ValueError(
+                    "v2 boundary descriptor requires ring_length > 0"
+                )
+            if self.page_offset < 0:
+                raise ValueError(
+                    "v2 boundary descriptor requires page_offset >= 0"
+                )
+            expected_page = tuple(
+                range(self.page_offset, self.page_offset + self.ring_length)
+            )
+            if tuple(self.row_indices) != expected_page:
+                raise ValueError(
+                    "v2 boundary descriptor row_indices must span exactly "
+                    f"[{self.page_offset}, {self.page_offset + self.ring_length}), "
+                    f"got {self.row_indices[:4]}..."
+                )
+            if not self.written_rows:
+                raise ValueError(
+                    "v2 boundary descriptor requires non-empty written_rows"
+                )
+            if len(set(self.written_rows)) != len(self.written_rows):
+                raise ValueError("v2 written_rows must not repeat")
+            if any(
+                row < 0 or row >= self.ring_length
+                for row in self.written_rows
+            ):
+                raise ValueError(
+                    "v2 written_rows must be page-local indices in "
+                    f"[0, {self.ring_length})"
+                )
+        elif (
+            self.ring_length != -1
+            or self.page_offset != -1
+            or self.written_rows
+        ):
+            raise ValueError(
+                "v1 boundary descriptor must not carry v2 ring fields; "
+                "emit a v2 descriptor instead"
+            )
         expected = compute_boundary_checksum(
             self.snapshot_id,
             self.resource_id,
