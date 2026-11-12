@@ -6,16 +6,17 @@ the worker-facing wire state of the layerwise protocol (registration acks,
 per-resource host payloads, all-or-nothing snapshot commits, prefix lookups
 and the single snapshot lease).
 
-Storage model (S0 milestone):
+Storage model (S0 -> S1 milestones):
 
 * Payloads are plain host bytes staged by ``store_resource`` and published
   atomically by ``commit_layerwise_snapshot``; nothing is served before the
   commit succeeds.
-* The boundary-state codec (C2) is not available yet, so every published
-  snapshot carries empty boundaries and the lookup validity predicate
-  rejects boundary-less commits. Lookups therefore report an honest full
-  miss (``matched_end == 0``) instead of a half-restored hit, and the
-  capability tuple advertises this explicitly.
+* Since S1 the engine-side C2 boundary codec exists: commits may carry real
+  :class:`~lmcache.v1.multiprocess.layerwise_protocol.BoundaryStateDescriptor`
+  entries, and boundary-complete snapshots are lookup-valid and restorable.
+  Boundary-less commits remain legal but stay cold-only storage: the lookup
+  validity predicate rejects them so a hit is never half-restored, and the
+  capability tuple advertises what the server can serve.
 
 The module is engine agnostic: it never imports torch/vllm and keeps all
 state in plain Python structures guarded by one lock, so building it is
@@ -52,13 +53,14 @@ from lmcache.v1.multiprocess.request_handler import request_handler
 
 logger = init_logger(__name__)
 
-#: Capabilities advertised to the worker in registration acks. The boundary
-#: codec is deliberately absent: lookups cannot hit until C2 lands (S1).
-LAYERWISE_CAPABILITIES = ("token_range_host_storage",)
+#: Capabilities advertised to the worker in registration acks. Since S1 the
+#: engine-side C2 codec can produce boundary-complete snapshots, and this
+#: module serves lookups and retrievals against them.
+LAYERWISE_CAPABILITIES = ("token_range_host_storage", "boundary_state_codec")
 
 
 def _snapshot_boundaries_present(commit: LayerwiseSnapshotCommit) -> bool:
-    """Validity predicate for S0: only boundary-complete snapshots may hit.
+    """Validity predicate: only boundary-complete snapshots may hit.
 
     Args:
         commit: Published snapshot commit to validate.
@@ -69,6 +71,37 @@ def _snapshot_boundaries_present(commit: LayerwiseSnapshotCommit) -> bool:
         never be restored into a serving prefix.
     """
     return len(commit.boundaries) > 0
+
+
+def _matched_end_from_boundaries(commit: LayerwiseSnapshotCommit) -> int:
+    """Derive the restorable token position from a commit's boundaries.
+
+    Args:
+        commit: Boundary-complete snapshot commit whose boundaries the
+            engine codec produced.
+
+    Returns:
+        The largest engine-visible boundary token position expressed as an
+        ``int`` (a commit may describe several scratch resources whose
+        boundaries sit at the same restorable prefix end).
+
+    Raises:
+        ValueError: If any boundary token is not a decimal integer. The
+            C2 codec writes numeric token positions; anything else is a
+            protocol violation and must fail closed rather than serve a
+            wrong ``matched_end``.
+    """
+    ends: list[int] = []
+    for boundary in commit.boundaries:
+        try:
+            ends.append(int(boundary.boundary_token))
+        except ValueError as error:
+            raise ValueError(
+                f"boundary {boundary.resource_id} of snapshot "
+                f"{commit.snapshot_id} carries non-numeric boundary token "
+                f"{boundary.boundary_token!r}"
+            ) from error
+    return max(ends) if ends else 0
 
 
 @dataclass
@@ -259,7 +292,7 @@ class LayerwiseTransferModule(DiscoverableModule):
             A ``(result, payload)`` pair; on the msgpack wire the tuple is
             decoded as a two-item list. ``status`` is ``miss`` with an
             empty payload whenever no boundary-complete snapshot owns the
-            resource (always, until the C2 codec lands).
+            resource (cold-only commits are never restorable).
         """
         miss = ResourceTransferResult(
             operation_id=spec.operation_id,
@@ -342,8 +375,8 @@ class LayerwiseTransferModule(DiscoverableModule):
             The lookup result with a granted lease, or ``None`` when no
             boundary-complete snapshot exists. ``LayerwiseLookupResult``
             itself cannot represent a miss (its wire contract requires a
-            real snapshot/lease), so ``None`` *is* the miss: always, until
-            the C2 boundary codec exists.
+            real snapshot/lease), so ``None`` *is* the miss: a miss is
+            never fabricated into a partial hit.
         """
         with self._lock:
             state = self._registrations.get((request.plan_hash, request.layout_hash))
@@ -368,9 +401,7 @@ class LayerwiseTransferModule(DiscoverableModule):
                 )
             )
             return LayerwiseLookupResult(
-                matched_end=commit.boundaries[-1].boundary_token
-                if commit.boundaries
-                else 0,
+                matched_end=_matched_end_from_boundaries(commit),
                 snapshot_id=commit.snapshot_id,
                 resource_ids=resources,
                 lease_id=lease_id,
@@ -410,7 +441,7 @@ class LayerwiseTransferModule(DiscoverableModule):
                     for state in self._registrations.values()
                     for payload in state.staged.values()
                 ),
-                "boundary_codec": "unavailable-s0",
+                "boundary_codec": "c2-v1",
             }
 
     def close(self) -> None:
