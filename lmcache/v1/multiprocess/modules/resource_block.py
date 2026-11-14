@@ -19,6 +19,7 @@ lost index after a restart degrades to a miss, never to a wrong hit.
 # Standard
 from dataclasses import dataclass, field
 import threading
+import time
 from typing import TYPE_CHECKING, Any
 
 # Third Party
@@ -88,24 +89,68 @@ class StockResourceBlockStore:
     modules: a write reserves the exact key, copies the bytes and calls
     ``finish_write``, which is the point at which the block becomes visible.
     Reads take a read lock, copy the bytes out and release it.
+
+    Writes are idempotent for identical bytes.  Several v2 workers can share
+    one stock identity (MLA replicates KV across the TP ranks), so they race
+    to store the same resource block: only one ``reserve_write`` can own the
+    buffer and the losers must not turn it into an IO error.  A loser verifies
+    the resident payload and reports success when the bytes match; a resident
+    payload that differs is never overwritten and reports failure.
     """
 
-    def __init__(self, storage_manager: Any) -> None:
+    #: Bounded retry budget while another writer is still committing the key.
+    DEFAULT_WRITE_RETRIES = 10
+    #: Delay in seconds between retries.
+    DEFAULT_WRITE_RETRY_DELAY = 0.01
+
+    def __init__(
+        self,
+        storage_manager: Any,
+        *,
+        write_retries: int = DEFAULT_WRITE_RETRIES,
+        write_retry_delay: float = DEFAULT_WRITE_RETRY_DELAY,
+    ) -> None:
+        if write_retries < 0:
+            raise ValueError("write_retries must be non-negative")
+        if write_retry_delay < 0:
+            raise ValueError("write_retry_delay must be non-negative")
         self._storage_manager = storage_manager
+        self._write_retries = int(write_retries)
+        self._write_retry_delay = float(write_retry_delay)
 
     def write(self, key: Any, payload: bytes) -> bool:
-        """Write one payload under ``key``; ``False`` when no buffer was free."""
+        """Store one payload under ``key``.
+
+        Args:
+            key: Final stock object key of the block.
+            payload: Opaque block bytes.  An identical resident payload makes
+                the write a successful no-op.
+
+        Returns:
+            True when ``key`` holds exactly ``payload`` after the call,
+            including when another writer has just stored it; False when no
+            reservation was possible and no identical resident payload exists,
+            or when a different payload already occupies the key.
+        """
         layout = MemoryLayoutDesc(
             shapes=[torch.Size([len(payload)])], dtypes=[torch.uint8]
         )
-        reserved = self._storage_manager.reserve_write([key], layout)
-        memory_obj = reserved.get(key)
-        if memory_obj is None or memory_obj.tensor is None:
-            return False
-        source = torch.frombuffer(bytearray(payload), dtype=torch.uint8)
-        memory_obj.tensor.view(torch.uint8).copy_(source)
-        self._storage_manager.finish_write([key], _l1_owners_of(reserved))
-        return True
+        for attempt in range(self._write_retries + 1):
+            reserved = self._storage_manager.reserve_write([key], layout)
+            memory_obj = reserved.get(key)
+            if memory_obj is not None and memory_obj.tensor is not None:
+                source = torch.frombuffer(bytearray(payload), dtype=torch.uint8)
+                memory_obj.tensor.view(torch.uint8).copy_(source)
+                self._storage_manager.finish_write([key], _l1_owners_of(reserved))
+                return True
+            # The key is already resident (or another thread is committing
+            # it): verify the bytes instead of treating this as an IO error.
+            existing = self.read(key)
+            if existing is not None:
+                return existing == payload
+            if attempt < self._write_retries:
+                time.sleep(self._write_retry_delay)
+        return False
 
     def read(self, key: Any) -> bytes | None:
         """Return the stored bytes, or ``None`` when the key is not resident."""
