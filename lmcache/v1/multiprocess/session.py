@@ -51,6 +51,9 @@ class Session:
     prefetch_hit_chunks: int = -1
     prefetch_locked_gids: tuple = ()
     prefetch_group_windows: tuple[int, ...] = ()
+    #: True when a resource-block provider supplied the hit and no stock
+    #: plain-chunk read locks were taken for it.
+    prefetch_synthetic: bool = False
     _prefetch_owners: dict[ObjectKey, int] = field(default_factory=dict, repr=False)
     extras: dict[str, Any] = field(default_factory=dict)
     _lookup_generation: int = field(default=0, repr=False)
@@ -162,6 +165,7 @@ class Session:
             self.prefetch_hit_chunks = -1
             self.prefetch_locked_gids = ()
             self.prefetch_group_windows = group_windows
+            self.prefetch_synthetic = False
             self._lookup_generation += 1
             self._failed_retrieve_releases.clear()
             self._prefetch_owners.clear()
@@ -176,7 +180,31 @@ class Session:
         with self._lock:
             self.prefetch_hit_chunks = hit_chunks
             self.prefetch_locked_gids = locked_gids
+            self.prefetch_synthetic = False
             self._prefetch_owners = dict(l1_owners) if l1_owners is not None else {}
+
+    def record_synthetic_prefetch_result(
+        self,
+        hit_chunks: int,
+        locked_gids: tuple[int, ...],
+    ) -> None:
+        """Record a resource-block hit that took no plain stock locks.
+
+        The hit was verified by the resource-block provider against its
+        completeness index instead of by a stock plain-key prefetch, so a
+        later ``free_lookup_locks`` must not resolve or release plain keys
+        for it.
+
+        Args:
+            hit_chunks: Absolute chunk count reported by the lookup.
+            locked_gids: Object groups the (nonexistent) prefetch would have
+                locked; kept so status consumers see the same lock model.
+        """
+        with self._lock:
+            self.prefetch_hit_chunks = hit_chunks
+            self.prefetch_locked_gids = locked_gids
+            self.prefetch_synthetic = True
+            self._prefetch_owners = {}
 
     def get_prefetch_owners(self) -> dict[ObjectKey, int]:
         """Snapshot the L1 owners whose read locks this session's lookup retained."""
@@ -195,6 +223,10 @@ class Session:
             lookup_key = self.lookup_ipc_key
             hit_chunks = self.prefetch_hit_chunks
             if lookup_key is None or hit_chunks < 0:
+                return None
+            if self.prefetch_synthetic:
+                # The resource-block hit never locked plain stock chunks;
+                # there is no lookup-level lock to release.
                 return None
 
             same_lookup = (

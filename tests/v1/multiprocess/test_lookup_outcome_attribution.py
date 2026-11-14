@@ -122,6 +122,8 @@ def _end_metadata(
     l2_rows = l2_rows if l2_rows is not None else miss_rows
 
     ctx = MagicMock()
+    # No resource-block provider: exercise the stock plain-key lookup path.
+    ctx.resource_block_visibility = None
     # No previous lookup to settle: ``lookup`` claims any unreleased
     # result before ``begin_lookup`` resets it.
     _sess = ctx.session_manager.get_or_create.return_value

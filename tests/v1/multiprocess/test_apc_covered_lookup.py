@@ -80,6 +80,8 @@ def _make_key(n_chunks: int, start_chunks: int = 0) -> IPCCacheServerKey:
 
 def _ctx_with_hashes(n_chunks: int) -> MagicMock:
     ctx = MagicMock()
+    # No resource-block provider: exercise the stock plain-key lookup path.
+    ctx.resource_block_visibility = None
     ctx.chunk_size = CHUNK_SIZE
     ctx.token_hasher.compute_packed_chunk_hashes.return_value = [
         bytes([i]) * 4 for i in range(n_chunks)

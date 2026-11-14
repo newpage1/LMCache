@@ -447,7 +447,22 @@ class ResourceBlockModule(DiscoverableModule):
         found_chunks: int,
         chunk_size: int,
     ) -> int:
-        """Cap a stock hit (in chunks) to the complete resource-block prefix."""
+        """Cap a stock hit (in chunks) to the complete resource-block prefix.
+
+        This is the raw completeness query: it returns 0 when no resource
+        block is complete, including when this server has no registration
+        for ``stock_key``. Lookup code that must distinguish "v2 deployment"
+        from "legacy plain-key deployment" uses :meth:`stock_visible_chunks`
+        instead.
+
+        Args:
+            stock_key: Stock cache key of the request being looked up.
+            found_chunks: Chunk count the caller is willing to accept.
+            chunk_size: Tokens per stock chunk.
+
+        Returns:
+            The longest verified prefix in chunks, capped by ``found_chunks``.
+        """
         request = ResourceBlockLookupRequest(
             registration_epoch=0,
             stock_key=stock_key,
@@ -459,6 +474,55 @@ class ResourceBlockModule(DiscoverableModule):
                 best = max(best, self._visible_prefix(state, request))
         if chunk_size <= 0:
             return 0
+        return min(int(found_chunks), best // int(chunk_size))
+
+    def stock_visible_chunks(
+        self,
+        stock_key: "IPCCacheServerKey",
+        found_chunks: int,
+        chunk_size: int,
+    ) -> int | None:
+        """Return the resource-block verified prefix for a stock lookup.
+
+        Unlike :meth:`visible_prefix`, this distinguishes an inactive v2
+        deployment from a v2 deployment with an incomplete prefix:
+
+        * ``None`` -- no registration matches ``stock_key``'s model/world, so
+          this server has no v2 client for the request. The caller must keep
+          the stock plain-key lookup untouched.
+        * ``0`` -- a v2 registration exists but no endpoint of the requested
+          prefix is complete; the request must miss rather than fall back to
+          plain chunk keys the v2 client never wrote.
+        * ``n`` -- the longest complete resource-block endpoint, in chunks.
+
+        The suffix namespace (plan/layout/salt) and the "token resources
+        complete on every kv rank, endpoint boundary committed" rule are
+        enforced by :meth:`_visible_prefix`, which also allows intermediate
+        chunks without a boundary capture.
+
+        Args:
+            stock_key: Stock cache key of the request being looked up.
+            found_chunks: Chunk count the caller is willing to accept.
+            chunk_size: Tokens per stock chunk.
+
+        Returns:
+            The verified prefix in chunks, or ``None`` when the server has
+            no v2 registration covering the key.
+        """
+        if chunk_size <= 0:
+            return 0
+        request = ResourceBlockLookupRequest(
+            registration_epoch=0,
+            stock_key=stock_key,
+            limit=int(found_chunks) * int(chunk_size),
+        )
+        with self._lock:
+            candidates = self._candidate_states(request)
+            if not candidates:
+                return None
+            best = 0
+            for state in candidates:
+                best = max(best, self._visible_prefix(state, request))
         return min(int(found_chunks), best // int(chunk_size))
 
     # ------------------------------------------------------------------

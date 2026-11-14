@@ -137,6 +137,7 @@ def _make_free_locks_ctx(
     session = ctx.session_manager.get_or_create.return_value
     session.prefetch_hit_chunks = hit_chunks
     session.prefetch_locked_gids = tuple(locked_gids)
+    session.prefetch_synthetic = False
     session.lookup_ipc_key = _free_locks_key(1024, start=lookup_start, end=1024)
     return ctx
 

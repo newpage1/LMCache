@@ -43,6 +43,8 @@ def _captured_lookup_key_groups(
     reaching into a private helper.
     """
     ctx = MagicMock()
+    # No resource-block provider: exercise the stock plain-key lookup path.
+    ctx.resource_block_visibility = None
     # No previous lookup to settle: ``lookup`` claims any unreleased
     # result before ``begin_lookup`` resets it.
     _sess = ctx.session_manager.get_or_create.return_value
@@ -109,6 +111,8 @@ def test_lookup_single_group_matches_single_group_expansion():
 def test_lookup_hashing_stops_at_key_end() -> None:
     """LOOKUP must not hash chunks beyond the IPC key's requested range."""
     ctx = MagicMock()
+    # No resource-block provider: exercise the stock plain-key lookup path.
+    ctx.resource_block_visibility = None
     # No previous lookup to settle: ``lookup`` claims any unreleased
     # result before ``begin_lookup`` resets it.
     _sess = ctx.session_manager.get_or_create.return_value

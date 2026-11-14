@@ -51,6 +51,8 @@ class _ConfiguredPolicy(KVLoadPolicy):
 def _ctx() -> MagicMock:
     ctx = MagicMock()
     ctx.chunk_size = CHUNK_SIZE
+    # No resource-block provider: these tests exercise the stock plain-key path.
+    ctx.resource_block_visibility = None
     ctx.event_bus.has_subscribers.return_value = False
     ctx.layout_desc_registry.find_attn_desc.return_value = AttnWindowDesc(
         num_chunks_in_sw=[-1], world_size=1

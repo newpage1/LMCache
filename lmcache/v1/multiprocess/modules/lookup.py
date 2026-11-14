@@ -124,6 +124,9 @@ class _PrefetchJob:
     # Names the ``lookup()`` branch that returned before submitting a prefetch
     # task; empty on the normal path.
     early_exit_reason: str = ""
+    # Absolute chunk count supplied by the resource-block provider instead of
+    # a plain stock prefetch; non-zero means no stock read lock was taken.
+    synthetic_hit_chunks: int = 0
 
 
 class LookupModule(DiscoverableModule):
@@ -249,17 +252,43 @@ class LookupModule(DiscoverableModule):
 
         # A v2 deployment installs a resource-block provider: the stock chunks
         # are only restorable when the matching token blocks and the endpoint
-        # boundary blocks are complete.  Cap before building the prefetch so
-        # the read locks and the reported hit describe the same prefix.
+        # boundary blocks are complete.  A v2 client writes only resource-block
+        # namespaced keys, so a verified endpoint replaces the plain-key
+        # prefetch instead of merely capping it.
         provider = self._ctx.resource_block_visibility
+        visible_chunks: int | None = None
         if provider is not None:
-            visible_chunks = int(
-                provider.visible_prefix(
-                    key, len(chunk_hashes), self._ctx.chunk_size
+            stock_visible = getattr(provider, "stock_visible_chunks", None)
+            if callable(stock_visible):
+                # The provider can tell a v2 deployment (int) apart from a
+                # deployment without a v2 registration (None, keep the stock
+                # plain-key path untouched).
+                endpoint = stock_visible(key, len(chunk_hashes), self._ctx.chunk_size)
+                if endpoint is not None:
+                    visible_chunks = max(0, min(int(endpoint), len(chunk_hashes)))
+                    chunk_hashes = chunk_hashes[:visible_chunks]
+                    if not chunk_hashes:
+                        self._register_empty_prefetch_job(
+                            key,
+                            requested_tokens=requested_tokens,
+                            early_exit_reason="resource_blocks_incomplete",
+                        )
+                        return
+            else:
+                # Third-party provider without the deployment probe: its value
+                # only caps the stock plain-key hit.
+                cap = max(
+                    0,
+                    min(
+                        int(
+                            provider.visible_prefix(
+                                key, len(chunk_hashes), self._ctx.chunk_size
+                            )
+                        ),
+                        len(chunk_hashes),
+                    ),
                 )
-            )
-            if visible_chunks < len(chunk_hashes):
-                chunk_hashes = chunk_hashes[:visible_chunks]
+                chunk_hashes = chunk_hashes[:cap]
                 if not chunk_hashes:
                     self._register_empty_prefetch_job(
                         key,
@@ -338,6 +367,21 @@ class LookupModule(DiscoverableModule):
                 attn_desc=attn_desc,
                 engine_covered_chunks=start_chunk,
                 early_exit_reason="load_policy_recompute",
+            )
+            return
+
+        if visible_chunks is not None:
+            # The resource-block endpoint is the hit: there is no plain stock
+            # key for these tokens, so a plain-key prefetch could only report
+            # zero and would also lock objects the request never reads.
+            self._register_empty_prefetch_job(
+                key,
+                requested_tokens=looked_up_tokens,
+                num_object_groups=attn_desc.num_object_groups,
+                attn_desc=attn_desc,
+                start_chunk=start_chunk,
+                engine_covered_chunks=start_chunk,
+                synthetic_hit_chunks=visible_chunks,
             )
             return
 
@@ -467,6 +511,9 @@ class LookupModule(DiscoverableModule):
             )
             return 0
 
+        if job.synthetic_hit_chunks > 0:
+            # No storage prefetch exists for a resource-block hit.
+            return self._consume_prefetch_result(job)
         if not self._ctx.storage_manager.wait_prefetch_status(job.handle, timeout):
             return None
         return self.query_prefetch_status(request_id)
@@ -539,6 +586,10 @@ class LookupModule(DiscoverableModule):
                 "nothing to release",
                 key.request_id,
             )
+            return
+        if session.prefetch_synthetic:
+            # A resource-block hit never locked plain stock chunks, and the
+            # stock resolver would treat the empty lock set as "every group".
             return
         # Release exactly the groups the prefetch locked (std lookup: all;
         # CB prefix leg: its prefix set) -- releasing an unlocked group
@@ -658,6 +709,7 @@ class LookupModule(DiscoverableModule):
         start_chunk: int = 0,
         engine_covered_chunks: int = 0,
         early_exit_reason: str = "",
+        synthetic_hit_chunks: int = 0,
     ) -> None:
         """Register a job that resolves immediately without a prefetch.
 
@@ -673,6 +725,9 @@ class LookupModule(DiscoverableModule):
             early_exit_reason: The ``lookup()`` branch that returned before
                 submitting a prefetch; empty when the lookup simply had
                 nothing to fetch.
+            synthetic_hit_chunks: Absolute chunk count supplied by the
+                resource-block provider; non-zero marks a hit that holds no
+                plain-chunk read locks.
         """
         self._register_prefetch_job(
             _PrefetchJob(
@@ -698,6 +753,7 @@ class LookupModule(DiscoverableModule):
                 model_name=key.model_name,
                 cache_salt=key.cache_salt,
                 early_exit_reason=early_exit_reason,
+                synthetic_hit_chunks=synthetic_hit_chunks,
             )
         )
 
@@ -715,20 +771,34 @@ class LookupModule(DiscoverableModule):
             The hit chunk count, or None while the prefetch is still running
             (the job is kept so a later call can resolve it).
         """
-        result = self._ctx.storage_manager.query_prefetch_status(job.handle)
-        if result is None:
-            return None
-        if job.row_windows:
-            found_count, _retain = fold_unfold_grouped(
-                result.hit_cells, job.row_windows
-            )
-            l1_found_count, _l1_retain = fold_unfold_grouped(
-                result.l1_hit_cells, job.row_windows
-            )
-        else:
-            # Nothing was submitted (early exit), so nothing can be hit.
-            found_count = 0
+        synthetic = job.synthetic_hit_chunks > 0
+        if synthetic:
+            # The endpoint was verified against the resource-block completeness
+            # index at lookup time; there is no stock prefetch result to poll
+            # and no plain-key hit cells to fold.
+            found_count = max(0, job.synthetic_hit_chunks - job.start_chunk)
             l1_found_count = 0
+            l1_owners: dict[ObjectKey, int] = {}
+            l1_hit_keys = 0
+            l2_hit_keys = 0
+        else:
+            result = self._ctx.storage_manager.query_prefetch_status(job.handle)
+            if result is None:
+                return None
+            if job.row_windows:
+                found_count, _retain = fold_unfold_grouped(
+                    result.hit_cells, job.row_windows
+                )
+                l1_found_count, _l1_retain = fold_unfold_grouped(
+                    result.l1_hit_cells, job.row_windows
+                )
+            else:
+                # Nothing was submitted (early exit), so nothing can be hit.
+                found_count = 0
+                l1_found_count = 0
+            l1_owners = result.l1_owners
+            l1_hit_keys = result.l1_hit_count
+            l2_hit_keys = result.l2_hit_count
 
         # The fold covers only the looked-up sub-range: the tier split is
         # attributed on it, so the covered prefix never counts as an L1 hit.
@@ -742,11 +812,11 @@ class LookupModule(DiscoverableModule):
         # read-locked (see ``unfold``: full-attention groups lock the whole
         # hit prefix, sliding-window groups only its in-window suffix).
         session = self._ctx.session_manager.get_or_create(job.request_id)
-        session.record_prefetch_result(
-            found_count,
-            tuple(range(job.attn_desc.num_object_groups)),
-            result.l1_owners,
-        )
+        hit_gids = tuple(range(job.attn_desc.num_object_groups))
+        if synthetic:
+            session.record_synthetic_prefetch_result(found_count, hit_gids)
+        else:
+            session.record_prefetch_result(found_count, hit_gids, l1_owners)
 
         chunk_size = self._ctx.chunk_size
         covered_tokens = job.engine_covered_chunks * chunk_size
@@ -772,9 +842,10 @@ class LookupModule(DiscoverableModule):
                     "prompt_tokens": job.prompt_tokens,
                     "engine_hit_tokens": job.engine_hit_tokens,
                     "request_hit_tokens": request_hit_tokens,
-                    "l1_hit_keys": result.l1_hit_count,
-                    "l2_hit_keys": result.l2_hit_count,
+                    "l1_hit_keys": l1_hit_keys,
+                    "l2_hit_keys": l2_hit_keys,
                     "early_exit_reason": job.early_exit_reason,
+                    "resource_blocks_synthetic": synthetic,
                     "model_name": job.model_name,
                     "cache_salt": job.cache_salt,
                 },
