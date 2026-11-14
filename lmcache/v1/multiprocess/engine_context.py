@@ -235,6 +235,10 @@ class MPCacheServerContext:
         )
         self._event_bus = get_event_bus()
         self._layout_desc_registry = LayoutDescRegistry()
+        # Optional engine-neutral resource-block completeness provider. The
+        # stock lookup caps its hit to this provider's longest complete
+        # prefix; ``None`` leaves the legacy lookup untouched.
+        self._resource_block_visibility: object | None = None
 
     def close(self) -> None:
         """
@@ -247,6 +251,23 @@ class MPCacheServerContext:
     def chunk_size(self) -> int:
         """Chunk size for KV cache operations."""
         return self._chunk_size
+
+    @property
+    def resource_block_visibility(self) -> object | None:
+        """The installed resource-block prefix provider, if any."""
+        return self._resource_block_visibility
+
+    def set_resource_block_visibility(self, provider: object | None) -> None:
+        """Install the resource-block prefix provider used by lookup.
+
+        The provider must expose ``visible_prefix(stock_key, found_chunks,
+        chunk_size) -> int``. ``None`` restores stock lookup behaviour.
+        """
+        if provider is not None and not callable(
+            getattr(provider, "visible_prefix", None)
+        ):
+            raise TypeError("resource-block provider has no visible_prefix")
+        self._resource_block_visibility = provider
 
     @property
     def finalized_chunk_size(self) -> int | None:

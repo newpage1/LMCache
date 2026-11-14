@@ -36,6 +36,14 @@ from lmcache.v1.multiprocess.protocols.server_module import (
     ServerModuleCallRequest,
     ServerModuleCallResponse,
 )
+from lmcache.v1.multiprocess.resource_block_protocol import (
+    ResourceBlockAck,
+    ResourceBlockLookupRequest,
+    ResourceBlockLookupResult,
+    ResourceBlockRegistration,
+    ResourceBlockResult,
+    ResourceBlockSpec,
+)
 from lmcache.v1.multiprocess.rpc import rpc_method
 
 
@@ -319,6 +327,26 @@ class RequestClient(Protocol):
 
     @rpc_method
     def release_layerwise_lease(self, lease_id: str) -> MessagingFuture[bool]: ...
+
+    @rpc_method
+    def register_resource_blocks(
+        self, registration: ResourceBlockRegistration
+    ) -> MessagingFuture[ResourceBlockAck]: ...
+
+    @rpc_method
+    def store_resource_block(
+        self, spec: ResourceBlockSpec, payload: bytes
+    ) -> MessagingFuture[ResourceBlockResult]: ...
+
+    @rpc_method
+    def retrieve_resource_block(
+        self, spec: ResourceBlockSpec
+    ) -> MessagingFuture[tuple[ResourceBlockResult, bytes]]: ...
+
+    @rpc_method
+    def lookup_resource_blocks(
+        self, request: ResourceBlockLookupRequest
+    ) -> MessagingFuture[ResourceBlockLookupResult]: ...
 
     def close(self) -> None:
         """Close the client and release its transport resources."""

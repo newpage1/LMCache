@@ -247,6 +247,27 @@ class LookupModule(DiscoverableModule):
         # chunk granularity.
         requested_tokens = len(chunk_hashes) * self._ctx.chunk_size
 
+        # A v2 deployment installs a resource-block provider: the stock chunks
+        # are only restorable when the matching token blocks and the endpoint
+        # boundary blocks are complete.  Cap before building the prefetch so
+        # the read locks and the reported hit describe the same prefix.
+        provider = self._ctx.resource_block_visibility
+        if provider is not None:
+            visible_chunks = int(
+                provider.visible_prefix(
+                    key, len(chunk_hashes), self._ctx.chunk_size
+                )
+            )
+            if visible_chunks < len(chunk_hashes):
+                chunk_hashes = chunk_hashes[:visible_chunks]
+                if not chunk_hashes:
+                    self._register_empty_prefetch_job(
+                        key,
+                        requested_tokens=requested_tokens,
+                        early_exit_reason="resource_blocks_incomplete",
+                    )
+                    return
+
         # Guard with has_subscribers() to avoid allocating the metadata dict
         # (including dtype/shape list comprehensions) when no subscriber is
         # listening (e.g. lookup hash logger is disabled).
