@@ -45,6 +45,7 @@ from lmcache.v1.multiprocess.layerwise_protocol import (
     ResourceTransferResult,
     ResourceTransferSpec,
 )
+from lmcache.v1.multiprocess import dsv41_sampling
 from lmcache.v1.multiprocess.layerwise_runtime import (
     LayerwiseSnapshotStore,
     LayerwiseTransferIndex,
@@ -185,6 +186,15 @@ class LayerwiseTransferModule(DiscoverableModule):
                         f"{state.registration.registration_epoch}"
                     )
                 if registration == state.registration:
+                    dsv41_sampling.emit(
+                        "server",
+                        "server_register",
+                        plan_hash=registration.plan_hash,
+                        layout_hash=registration.layout_hash,
+                        epoch=registration.registration_epoch,
+                        generation=state.server_generation,
+                        reaccepted=True,
+                    )
                     return LayerwiseRegistrationAck(
                         protocol_version=LAYERWISE_PROTOCOL_VERSION,
                         server_generation=state.server_generation,
@@ -200,6 +210,15 @@ class LayerwiseTransferModule(DiscoverableModule):
                 index=LayerwiseTransferIndex(
                     registration_epoch=registration.registration_epoch
                 ),
+            )
+            dsv41_sampling.emit(
+                "server",
+                "server_register",
+                plan_hash=registration.plan_hash,
+                layout_hash=registration.layout_hash,
+                epoch=registration.registration_epoch,
+                generation=generation,
+                reaccepted=False,
             )
             logger.info(
                 "Layerwise registration accepted: plan=%s layout=%s epoch=%d "
@@ -248,6 +267,16 @@ class LayerwiseTransferModule(DiscoverableModule):
         with self._lock:
             state = self._state_for(spec)
             if state is None:
+                dsv41_sampling.emit(
+                    "server",
+                    "server_store",
+                    operation_id=spec.operation_id,
+                    resource_id=spec.resource_id,
+                    key=spec.key,
+                    wire_bytes=len(payload),
+                    status="invalid",
+                    error_code="UNKNOWN_REGISTRATION",
+                )
                 return ResourceTransferResult(
                     operation_id=spec.operation_id,
                     resource_id=spec.resource_id,
@@ -269,6 +298,15 @@ class LayerwiseTransferModule(DiscoverableModule):
                 )
             state.staged[(spec.key, spec.resource_id)] = bytes(payload)
             state.op_resources[spec.operation_id] = spec.resource_id
+            dsv41_sampling.emit(
+                "server",
+                "server_store",
+                operation_id=spec.operation_id,
+                resource_id=spec.resource_id,
+                key=spec.key,
+                wire_bytes=len(payload),
+                status="ok",
+            )
             result = ResourceTransferResult(
                 operation_id=spec.operation_id,
                 resource_id=spec.resource_id,
@@ -305,11 +343,31 @@ class LayerwiseTransferModule(DiscoverableModule):
         with self._lock:
             state = self._state_for(spec)
             if state is None:
+                dsv41_sampling.emit(
+                    "server",
+                    "server_retrieve",
+                    operation_id=spec.operation_id,
+                    resource_id=spec.resource_id,
+                    key=spec.key,
+                    wire_bytes=0,
+                    status="miss",
+                    error_code="UNKNOWN_REGISTRATION",
+                )
                 return miss, b""
             commit = state.snapshots.lookup(
                 spec.key, is_valid=_snapshot_boundaries_present
             )
             if commit is None:
+                dsv41_sampling.emit(
+                    "server",
+                    "server_retrieve",
+                    operation_id=spec.operation_id,
+                    resource_id=spec.resource_id,
+                    key=spec.key,
+                    wire_bytes=0,
+                    status="miss",
+                    error_code="NOT_COMMITTED",
+                )
                 return miss, b""
             committed_resources = {
                 state.op_resources.get(operation_id)
@@ -317,7 +375,28 @@ class LayerwiseTransferModule(DiscoverableModule):
             }
             payload = state.staged.get((spec.key, spec.resource_id))
             if spec.resource_id not in committed_resources or payload is None:
+                dsv41_sampling.emit(
+                    "server",
+                    "server_retrieve",
+                    operation_id=spec.operation_id,
+                    resource_id=spec.resource_id,
+                    key=spec.key,
+                    wire_bytes=0,
+                    status="miss",
+                    error_code="NOT_IN_SNAPSHOT",
+                    snapshot_id=commit.snapshot_id,
+                )
                 return miss, b""
+            dsv41_sampling.emit(
+                "server",
+                "server_retrieve",
+                operation_id=spec.operation_id,
+                resource_id=spec.resource_id,
+                key=spec.key,
+                wire_bytes=len(payload),
+                status="ok",
+                snapshot_id=commit.snapshot_id,
+            )
             return (
                 ResourceTransferResult(
                     operation_id=spec.operation_id,
@@ -360,6 +439,15 @@ class LayerwiseTransferModule(DiscoverableModule):
             outcome = state.snapshots.commit_snapshot(commit, state.index)
             if outcome == "published":
                 self._committed_snapshots += 1
+            dsv41_sampling.emit(
+                "server",
+                "server_commit",
+                snapshot_id=commit.snapshot_id,
+                key=commit.key,
+                operation_count=len(commit.operation_ids),
+                boundary_count=len(commit.boundaries),
+                outcome=outcome,
+            )
             return True
 
     @request_handler()
@@ -384,11 +472,25 @@ class LayerwiseTransferModule(DiscoverableModule):
                 state is None
                 or state.registration.registration_epoch != request.registration_epoch
             ):
+                dsv41_sampling.emit(
+                    "server",
+                    "server_lookup",
+                    key=request.key,
+                    hit=False,
+                    reason="unregistered_identity",
+                )
                 return None
             commit = state.snapshots.lookup(
                 request.key, is_valid=_snapshot_boundaries_present
             )
             if commit is None:
+                dsv41_sampling.emit(
+                    "server",
+                    "server_lookup",
+                    key=request.key,
+                    hit=False,
+                    reason="no_boundary_complete_snapshot",
+                )
                 return None
             lease_id = state.snapshots.acquire_lease(commit.snapshot_id)
             resources = tuple(
@@ -399,6 +501,17 @@ class LayerwiseTransferModule(DiscoverableModule):
                         if operation_id in state.op_resources
                     }
                 )
+            )
+            dsv41_sampling.emit(
+                "server",
+                "server_lookup",
+                key=request.key,
+                hit=True,
+                matched_end=_matched_end_from_boundaries(commit),
+                snapshot_id=commit.snapshot_id,
+                lease_id=lease_id,
+                resources=list(resources),
+                boundary_count=len(commit.boundaries),
             )
             return LayerwiseLookupResult(
                 matched_end=_matched_end_from_boundaries(commit),
@@ -424,7 +537,19 @@ class LayerwiseTransferModule(DiscoverableModule):
         with self._lock:
             for state in self._registrations.values():
                 if state.snapshots.release_lease(lease_id):
+                    dsv41_sampling.emit(
+                        "server",
+                        "server_release",
+                        lease_id=lease_id,
+                        released=True,
+                    )
                     return True
+            dsv41_sampling.emit(
+                "server",
+                "server_release",
+                lease_id=lease_id,
+                released=False,
+            )
             return False
 
     # ------------------------------------------------------------------
