@@ -335,15 +335,19 @@ class ResourceBlockModule(DiscoverableModule):
             return self._result(spec, STATUS_FAILED, ERROR_INVALID_SPEC)
         with self._lock:
             completeness = self._completeness_for(state, spec.stock_key)
-            completeness_key = (spec.resource_id, ranks[0])
             if resource.storage_kind == "boundary_state":
-                done = completeness.boundaries.setdefault(completeness_key, set())
-                if spec.prefix_end in done:
-                    return self._result(spec, STATUS_OK, ERROR_ALREADY_PRESENT)
+                table = completeness.boundaries
+                marker = spec.prefix_end
             else:
-                done = completeness.tokens.setdefault(completeness_key, set())
-                if chunk_index in done:
-                    return self._result(spec, STATUS_OK, ERROR_ALREADY_PRESENT)
+                table = completeness.tokens
+                marker = chunk_index
+            # A fanout stock key writes the same payload to every rank key, so
+            # the block is only a duplicate when *every* rank already has it.
+            if all(
+                marker in table.get((spec.resource_id, rank), set())
+                for rank in ranks
+            ):
+                return self._result(spec, STATUS_OK, ERROR_ALREADY_PRESENT)
         if resource.storage_kind == "boundary_state":
             keys = self._boundary_keys(spec, ranks)
         else:
@@ -365,15 +369,16 @@ class ResourceBlockModule(DiscoverableModule):
         with self._lock:
             completeness = self._completeness_for(state, spec.stock_key)
             if resource.storage_kind == "boundary_state":
-                completeness.boundaries.setdefault(
-                    (spec.resource_id, ranks[0]), set()
-                ).add(spec.prefix_end)
-                self._counters["blocks_stored"] += 1
+                table = completeness.boundaries
+                marker = spec.prefix_end
             else:
-                completeness.tokens.setdefault(
-                    (spec.resource_id, ranks[0]), set()
-                ).add(chunk_index)
-                self._counters["blocks_stored"] += 1
+                table = completeness.tokens
+                marker = chunk_index
+            # Record completeness for every rank the write covered: the stock
+            # lookup key has no worker id and therefore requires all ranks.
+            for rank in ranks:
+                table.setdefault((spec.resource_id, rank), set()).add(marker)
+            self._counters["blocks_stored"] += 1
         return self._result(spec, STATUS_OK, "")
 
     @request_handler(HandlerType.BLOCKING)
