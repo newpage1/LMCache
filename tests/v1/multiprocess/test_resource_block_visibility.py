@@ -8,7 +8,7 @@ involved.  The stock lookup side is covered by
 """
 
 # Standard
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import json
 import struct
@@ -24,6 +24,7 @@ from lmcache.v1.multiprocess.modules.resource_block import ResourceBlockModule
 from lmcache.v1.multiprocess.resource_block_protocol import (
     BOUNDARY_PAYLOAD_MAGIC,
     ERROR_PAYLOAD_CORRUPT,
+    ERROR_PLAN_MISMATCH,
     ERROR_STALE_GENERATION,
     ERROR_UNSUPPORTED_BOUNDARY_SCHEMA,
     STATUS_FAILED,
@@ -432,6 +433,26 @@ def test_stale_generation_store_is_rejected_and_miss_reports():
         _spec(key, RESOURCES[0], direction="load", start=0, end=CHUNK)
     )
     assert miss.status == STATUS_MISS
+    assert payload == b""
+
+
+def test_plan_hash_mismatch_is_plan_mismatch():
+    module, _ = _module()
+    key = _key(_tokens(TOKENS))
+    spec = _spec(key, RESOURCES[0], start=0, end=CHUNK)
+    wrong_plan = replace(spec, plan_hash="sha256:not-this-plan")
+
+    stored = module.store_resource_block(
+        wrong_plan, _token_payload(RESOURCES[0])
+    )
+    assert stored.status == STATUS_FAILED
+    assert stored.error_code == ERROR_PLAN_MISMATCH
+
+    miss, payload = module.retrieve_resource_block(
+        replace(wrong_plan, direction="load")
+    )
+    assert miss.status == STATUS_FAILED
+    assert miss.error_code == ERROR_PLAN_MISMATCH
     assert payload == b""
 
 

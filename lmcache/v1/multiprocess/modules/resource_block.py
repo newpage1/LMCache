@@ -41,6 +41,7 @@ from lmcache.v1.multiprocess.resource_block_protocol import (
     ERROR_IO_ERROR,
     ERROR_LAYOUT_MISMATCH,
     ERROR_PAYLOAD_CORRUPT,
+    ERROR_PLAN_MISMATCH,
     ERROR_RESOURCE_MISSING,
     ERROR_STALE_EPOCH,
     ERROR_STALE_GENERATION,
@@ -503,7 +504,10 @@ class ResourceBlockModule(DiscoverableModule):
         if spec.server_generation != state.server_generation:
             raise _SpecError(ERROR_STALE_GENERATION)
         if spec.plan_hash != registration.plan_hash:
-            raise _SpecError(ERROR_INVALID_SPEC)
+            # A stale/wrong plan is a distinct client bug from an invalid
+            # payload shape; surface it so the worker can fail closed with a
+            # precise error instead of a generic invalid spec.
+            raise _SpecError(ERROR_PLAN_MISMATCH)
         if spec.layout_hash != registration.layout_hash:
             raise _SpecError(ERROR_LAYOUT_MISMATCH)
         resource = state.resources.get(spec.resource_id)
