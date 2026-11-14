@@ -28,6 +28,7 @@ import torch
 # First Party
 from lmcache.logging import init_logger
 from lmcache.v1.distributed.api import MemoryLayoutDesc, _lookup_kv_ranks
+from lmcache.v1.distributed.error import L1Error
 from lmcache.v1.multiprocess.engine_module import (
     DiscoverableModule,
     EngineModule,
@@ -153,13 +154,26 @@ class StockResourceBlockStore:
         return False
 
     def read(self, key: Any) -> bytes | None:
-        """Return the stored bytes, or ``None`` when the key is not resident."""
+        """Return the stored bytes, or ``None`` when the key is not resident.
+
+        ``reserve_read`` reports a granted read lock as
+        ``(L1Error.SUCCESS, memory_obj)`` and an absent key as
+        ``(L1Error.KEY_NOT_EXIST, None)``; the error slot is never ``None``.
+        Every granted reservation is released in ``finally`` so repeated
+        read-backs (for example the duplicate-write verification path) cannot
+        accumulate ``read_locked`` entries.  Absent keys never took a lock and
+        are simply skipped.
+        """
         for manager in self._storage_manager.l1_managers():
             reserved = manager.reserve_read([key])
-            error, memory_obj = reserved.get(key, (None, None))
-            if error is not None or memory_obj is None or memory_obj.tensor is None:
+            error, memory_obj = reserved.get(
+                key, (L1Error.KEY_NOT_EXIST, None)
+            )
+            if error != L1Error.SUCCESS:
                 continue
             try:
+                if memory_obj is None or memory_obj.tensor is None:
+                    continue
                 return memory_obj.tensor.view(torch.uint8).numpy().tobytes()
             finally:
                 manager.finish_read([key])

@@ -18,6 +18,7 @@ import pytest
 import torch
 
 # First Party
+from lmcache.v1.distributed.error import L1Error
 from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
 from lmcache.v1.multiprocess.layerwise import CacheTransferResource
 from lmcache.v1.multiprocess.modules.resource_block import ResourceBlockModule
@@ -91,11 +92,11 @@ class FakeL1:
         for key in keys:
             payload = self._storage.get(key)
             if payload is None:
-                result[key] = (object(), None)
+                result[key] = (L1Error.KEY_NOT_EXIST, None)
             else:
                 obj = FakeMemoryObj(len(payload))
                 obj.tensor.copy_(torch.frombuffer(bytearray(payload), dtype=torch.uint8))
-                result[key] = (None, obj)
+                result[key] = (L1Error.SUCCESS, obj)
         return result
 
     def finish_read(self, keys):
