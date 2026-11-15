@@ -268,10 +268,16 @@ class ResourceBlockModule(DiscoverableModule):
         self._lock = threading.RLock()
         self._registrations: dict[str, _Registration] = {}
         self._completeness: dict[tuple, _Completeness] = {}
-        # Reverse index from a stock object key to the completeness marker it
+        # Reverse index from a stock object key to every completeness marker it
         # backs.  L1 eviction/clear deletes objects without calling this
         # module, so the deletion listener uses this index to retire markers.
-        self._key_owners: dict[Any, tuple[tuple, str, int, object]] = {}
+        # Token object keys are content-addressed and shared by every
+        # registration that stored the same chunk (MLA folds the TP ranks onto
+        # one stock identity), so one key can back markers in several
+        # completeness tables; the index must therefore hold an owner *set*.
+        # A last-writer slot would let one eviction leave the other
+        # registrations advertising a payload the storage no longer has.
+        self._key_owners: dict[Any, set[tuple]] = {}
         self._next_generation = 1
         self._closed = False
         self._counters = {
@@ -392,11 +398,7 @@ class ResourceBlockModule(DiscoverableModule):
                 for key, value in self._completeness.items()
                 if key[0] != registration.instance_id
             }
-            self._key_owners = {
-                key: owner
-                for key, owner in self._key_owners.items()
-                if owner[0] in self._completeness
-            }
+            self._key_owners = self._filter_key_owners()
             self._counters["registered"] += 1
             return self._ack(state)
 
@@ -472,6 +474,20 @@ class ResourceBlockModule(DiscoverableModule):
             marker_hash_index = chunk_index
             if marker_hash_index >= len(chunk_hashes):
                 return self._result(spec, STATUS_FAILED, ERROR_INVALID_SPEC)
+        if resource.storage_kind == "boundary_state":
+            try:
+                keys = self._boundary_keys(spec, ranks)
+            except _SpecError as error:
+                return self._result(spec, STATUS_FAILED, error.code)
+        else:
+            keys = resource_block_object_keys(
+                spec.stock_key,
+                chunk_hashes[chunk_index],
+                plan_hash=spec.plan_hash,
+                layout_hash=spec.layout_hash,
+                resource_id=spec.resource_id,
+                ranks=ranks,
+            )
         with self._lock:
             completeness = self._completeness_for(state, spec.stock_key)
             if resource.storage_kind == "boundary_state":
@@ -486,18 +502,16 @@ class ResourceBlockModule(DiscoverableModule):
                 marker in table.get((spec.resource_id, rank), set())
                 for rank in ranks
             ):
+                # A duplicate store still proves this registration owns the
+                # object keys; keep the eviction index complete for it.
+                self._remember_key_owners(
+                    keys,
+                    ranks,
+                    self._completeness_key(state, spec.stock_key),
+                    spec.resource_id,
+                    marker,
+                )
                 return self._result(spec, STATUS_OK, ERROR_ALREADY_PRESENT)
-        if resource.storage_kind == "boundary_state":
-            keys = self._boundary_keys(spec, ranks)
-        else:
-            keys = resource_block_object_keys(
-                spec.stock_key,
-                chunk_hashes[chunk_index],
-                plan_hash=spec.plan_hash,
-                layout_hash=spec.layout_hash,
-                resource_id=spec.resource_id,
-                ranks=ranks,
-            )
         try:
             for key in keys:
                 if not self._store.write(key, payload):
@@ -519,14 +533,16 @@ class ResourceBlockModule(DiscoverableModule):
             for rank in ranks:
                 table.setdefault((spec.resource_id, rank), set()).add(marker)
             # Keep the reverse index so an L1 eviction/clear can retire the
-            # marker together with the object that backs it.
-            for key, rank in zip(keys, ranks):
-                self._key_owners[key] = (
-                    completeness_key,
-                    spec.resource_id,
-                    rank,
-                    marker,
-                )
+            # marker together with the object that backs it.  Token keys are
+            # shared by every registration that stored the same chunk, so the
+            # index keeps each of their owners instead of the last writer.
+            self._remember_key_owners(
+                keys,
+                ranks,
+                completeness_key,
+                spec.resource_id,
+                marker,
+            )
             self._counters["blocks_stored"] += 1
         return self._result(spec, STATUS_OK, "")
 
@@ -737,6 +753,35 @@ class ResourceBlockModule(DiscoverableModule):
             raise _SpecError(ERROR_INVALID_SPEC)
         return state
 
+    def _filter_key_owners(self) -> dict[Any, set[tuple]]:
+        """Drop key owners whose completeness row was replaced or removed."""
+        owners_by_key: dict[Any, set[tuple]] = {}
+        for key, owners in self._key_owners.items():
+            kept = {owner for owner in owners if owner[0] in self._completeness}
+            if kept:
+                owners_by_key[key] = kept
+        return owners_by_key
+
+    def _remember_key_owners(
+        self,
+        keys: list[Any],
+        ranks: list[int],
+        completeness_key: tuple,
+        resource_id: str,
+        marker: object,
+    ) -> None:
+        """Associate every written object key with this completeness marker.
+
+        The caller holds ``self._lock``.  Keys are appended to an owner set
+        instead of replacing the previous writer: token keys are shared by
+        every registration that stored the same chunk, and each of them must
+        be able to retire its own marker when the object is deleted.
+        """
+        for key, rank in zip(keys, ranks, strict=True):
+            self._key_owners.setdefault(key, set()).add(
+                (completeness_key, resource_id, rank, marker)
+            )
+
     def _completeness_key(
         self, state: _Registration, stock_key: "IPCCacheServerKey"
     ) -> tuple:
@@ -766,31 +811,38 @@ class ResourceBlockModule(DiscoverableModule):
         Called by the L1 manager listener on eviction, explicit deletion and
         CLEAR (including ``reset_external``).  Without this hook the module
         keeps advertising payloads the storage no longer holds, which turns a
-        prefix hit into a load failure inside the model forward.
+        prefix hit into a load failure inside the model forward.  A token
+        object key is shared by every registration that stored the same chunk,
+        so the deletion must retire *all* of its owners before the key leaves
+        the reverse index; retiring only the last writer would leave the other
+        registrations advertising the evicted payload.
         """
         with self._lock:
             for key in keys:
-                owner = self._key_owners.pop(key, None)
-                if owner is None:
+                owners = self._key_owners.pop(key, None)
+                if not owners:
                     continue
-                completeness_key, resource_id, rank, marker = owner
-                completeness = self._completeness.get(completeness_key)
-                if completeness is None:
-                    continue
-                table = (
-                    completeness.boundaries
-                    if isinstance(marker, tuple)
-                    else completeness.tokens
-                )
-                entries = table.get((resource_id, rank))
-                if entries is None:
-                    continue
-                entries.discard(marker)
-                if not entries:
-                    table.pop((resource_id, rank), None)
-                if not completeness.tokens and not completeness.boundaries:
-                    self._completeness.pop(completeness_key, None)
-                self._counters["blocks_invalidated"] += 1
+                retired = False
+                for completeness_key, resource_id, rank, marker in owners:
+                    completeness = self._completeness.get(completeness_key)
+                    if completeness is None:
+                        continue
+                    table = (
+                        completeness.boundaries
+                        if isinstance(marker, tuple)
+                        else completeness.tokens
+                    )
+                    entries = table.get((resource_id, rank))
+                    if entries is None:
+                        continue
+                    entries.discard(marker)
+                    if not entries:
+                        table.pop((resource_id, rank), None)
+                    if not completeness.tokens and not completeness.boundaries:
+                        self._completeness.pop(completeness_key, None)
+                    retired = True
+                if retired:
+                    self._counters["blocks_invalidated"] += 1
 
     def _candidate_states(
         self, request: ResourceBlockLookupRequest
