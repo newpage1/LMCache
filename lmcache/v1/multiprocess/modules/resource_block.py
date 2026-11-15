@@ -752,12 +752,20 @@ class ResourceBlockModule(DiscoverableModule):
         chunk_index = spec.prefix_end // self._chunk_size - 1
         if chunk_index < 0 or chunk_index >= len(chunk_hashes):
             raise _SpecError(ERROR_INVALID_SPEC)
+        # Compressor boundary state is rank-local: every TP rank keeps its
+        # own ring page and capture rows, so the payload bytes differ between
+        # ranks even though MLA folds all of them onto one stock identity.
+        # Namespace the object key by the writing registration so neighbours
+        # cannot overwrite or fail each other's capture; the retrieve path uses
+        # the same registration id and therefore reads back its own bytes.
         return resource_block_object_keys(
             spec.stock_key,
             chunk_hashes[chunk_index],
             plan_hash=spec.plan_hash,
             layout_hash=spec.layout_hash,
-            resource_id=f"{spec.resource_id}@{spec.prefix_end}",
+            resource_id=(
+                f"{spec.resource_id}@{spec.prefix_end}@{spec.instance_id}"
+            ),
             ranks=ranks,
         )
 
