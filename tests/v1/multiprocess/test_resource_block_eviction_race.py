@@ -53,11 +53,21 @@ class _RaceStore:
         self._inner = inner
         self.on_written = None
         self.fail_writes = False
+        # The fake L1 cannot finish two concurrent reservations of one key, so
+        # tests that interleave whole stores set this to serialize the writes
+        # while the window/interleaving logic stays concurrent.
+        self.write_lock = None
 
     def __getattr__(self, name: str):
         return getattr(self._inner, name)
 
     def write(self, key, payload: bytes) -> bool:
+        if self.write_lock is not None:
+            with self.write_lock:
+                return self._write(key, payload)
+        return self._write(key, payload)
+
+    def _write(self, key, payload: bytes) -> bool:
         if self.fail_writes:
             return False
         written = self._inner.write(key, payload)
@@ -337,4 +347,160 @@ def test_reregistration_during_the_race_window_does_not_publish_stale_markers():
             _boundary_payload(resource_id, CHUNK),
         )
         assert boundary.status == STATUS_OK, boundary
+    assert module.stock_visible_chunks(key, 1, CHUNK) == 1
+
+
+def _inject_deletion_at_close(module, *, before_delete=None):
+    """Defer a deletion into the gap right after the store window closes.
+
+    The t62 review pointed out that the close of the in-flight window and the
+    marker publication used to be two separate critical sections.  A deletion
+    delivered in between found no owner and then got a marker anyway.  This
+    helper patches ``_close_store_window`` so the deletion runs after the
+    counts were decremented but before the publication decision.
+    """
+    original = module._close_store_window
+
+    def close(keys):
+        deleted = original(keys)
+        if before_delete is not None:
+            before_delete()
+        module.on_l1_keys_deleted([keys[0]])
+        return deleted
+
+    module._close_store_window = close
+    return original
+
+
+def test_gap_deletion_at_the_close_boundary_blocks_publication():
+    module, store, ctx = _race_module()
+    key = _key(_tokens(TOKENS))
+
+    original = _inject_deletion_at_close(module)
+    results = _store_chunk_quiet(module, key, 0)
+    assert all(result.status == STATUS_FAILED for result in results)
+    assert all(result.error_code == ERROR_IO_ERROR for result in results)
+    assert module.report_status()["blocks_stored"] == 0
+    assert module.report_status()["store_race_hits"] == len(RESOURCES)
+    module._close_store_window = original
+
+    # A clean boundary must not surface the rolled-back token markers.
+    _store_boundary(module, key, CHUNK)
+    assert module.stock_visible_chunks(key, 1, CHUNK) == 0
+
+    _store_chunk_quiet(module, key, 0)
+    assert module.stock_visible_chunks(key, 1, CHUNK) == 1
+
+
+def test_gap_deletion_in_a_world2_store_blocks_every_rank():
+    module, store, ctx = _race_module(world=2)
+    key = _key(_tokens(TOKENS), world=2)
+
+    original = _inject_deletion_at_close(module)
+    results = _store_chunk_quiet(module, key, 0)
+    assert all(result.status == STATUS_FAILED for result in results)
+    assert all(result.error_code == ERROR_IO_ERROR for result in results)
+    module._close_store_window = original
+
+    _store_boundary(module, key, CHUNK)
+    assert module.stock_visible_chunks(key, 1, CHUNK) == 0
+
+    _store_chunk_quiet(module, key, 0)
+    assert module.stock_visible_chunks(key, 1, CHUNK) == 1
+
+
+def test_gap_deletion_during_reregistration_does_not_publish_stale_markers():
+    module, store, ctx = _race_module()
+    key = _key(_tokens(TOKENS))
+
+    original = _inject_deletion_at_close(
+        module,
+        before_delete=lambda: module.register_resource_blocks(
+            replace(_registration(epoch=2))
+        ),
+    )
+    result = module.store_resource_block(
+        _spec(key, RESOURCES[0]), _token_payload(RESOURCES[0], (0,))
+    )
+    assert result.status == STATUS_FAILED
+    assert result.error_code == ERROR_IO_ERROR
+    assert module.report_status()["registered"] == 2
+    module._close_store_window = original
+
+    ack = module.register_resource_blocks(replace(_registration(epoch=2)))
+    generation = ack.server_generation
+    boundary = module.store_resource_block(
+        replace(
+            _spec(key, BOUNDARIES[0], prefix_end=CHUNK, boundary=True),
+            registration_epoch=2,
+            server_generation=generation,
+        ),
+        _boundary_payload(BOUNDARIES[0], CHUNK),
+    )
+    assert boundary.status == STATUS_OK, boundary
+    assert module.stock_visible_chunks(key, 1, CHUNK) == 0
+
+    for resource_id in RESOURCES:
+        stored = module.store_resource_block(
+            replace(
+                _spec(key, resource_id),
+                registration_epoch=2,
+                server_generation=generation,
+            ),
+            _token_payload(resource_id, (0,)),
+        )
+        assert stored.status == STATUS_OK, stored
+    for resource_id in BOUNDARIES:
+        boundary = module.store_resource_block(
+            replace(
+                _spec(
+                    key,
+                    resource_id,
+                    direction="store",
+                    prefix_end=CHUNK,
+                    boundary=True,
+                ),
+                registration_epoch=2,
+                server_generation=generation,
+            ),
+            _boundary_payload(resource_id, CHUNK),
+        )
+        assert boundary.status == STATUS_OK, boundary
+    assert module.stock_visible_chunks(key, 1, CHUNK) == 1
+
+
+def test_concurrent_gap_deletions_leave_no_stale_markers():
+    module, store, ctx = _race_module()
+    key = _key(_tokens(TOKENS))
+
+    original = _inject_deletion_at_close(module)
+    store.write_lock = threading.Lock()
+    barrier = threading.Barrier(2)
+    errors: list[BaseException] = []
+
+    def churn() -> None:
+        try:
+            barrier.wait()
+            for _ in range(10):
+                result = module.store_resource_block(
+                    _spec(key, RESOURCES[0]), _token_payload(RESOURCES[0], (0,))
+                )
+                assert result.status == STATUS_FAILED
+        except BaseException as error:  # pragma: no cover - surfaced below
+            errors.append(error)
+
+    threads = [threading.Thread(target=churn) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=60)
+    assert not errors
+    assert not any(thread.is_alive() for thread in threads)
+    module._close_store_window = original
+
+    _store_boundary(module, key, CHUNK)
+    assert module.stock_visible_chunks(key, 1, CHUNK) == 0
+    assert module.report_status()["blocks_stored"] == len(BOUNDARIES)
+
+    _store_chunk_quiet(module, key, 0)
     assert module.stock_visible_chunks(key, 1, CHUNK) == 1

@@ -541,16 +541,55 @@ class ResourceBlockModule(DiscoverableModule):
             logger.exception("resource-block store failed for %s", spec.resource_id)
             write_failed = True
         finally:
+            # Closing the window, deciding the race and publishing the markers
+            # happen in one critical section.  Releasing the lock in between
+            # would let a deletion listener run after the key left the in-flight
+            # registry but before the marker exists, leaving a marker for a
+            # payload L1 already dropped (the fatal warm-load path).
             with self._lock:
                 raced_keys = self._close_store_window(keys)
+                # A deletion notification delivered at the end of the close
+                # window (after the counts were decremented) still sets a
+                # tombstone; re-read it here so it blocks publication.
+                raced_keys.update(
+                    key for key in keys if key in self._pending_deletions
+                )
+                if not write_failed and not raced_keys:
+                    completeness = self._completeness_for(state, spec.stock_key)
+                    if resource.storage_kind == "boundary_state":
+                        table = completeness.boundaries
+                        marker = (spec.prefix_end, chunk_hashes[marker_hash_index])
+                    else:
+                        table = completeness.tokens
+                        marker = chunk_hashes[marker_hash_index]
+                    # Record completeness for every rank the write covered: the
+                    # stock lookup key has no worker id and requires all ranks.
+                    for rank in ranks:
+                        table.setdefault((spec.resource_id, rank), set()).add(
+                            marker
+                        )
+                    # Keep the reverse index so an L1 eviction/clear can retire
+                    # the marker together with the object that backs it.  Token
+                    # keys are shared by every registration that stored the
+                    # same chunk, so the index keeps each of their owners.
+                    self._remember_key_owners(
+                        keys,
+                        ranks,
+                        completeness_key,
+                        spec.resource_id,
+                        marker,
+                    )
+                    self._counters["blocks_stored"] += 1
+                if raced_keys:
+                    self._counters["store_race_hits"] += 1
+                    self._counters["store_race_rollbacks"] += len(raced_keys)
+                self._finish_store_window(keys)
         if write_failed:
             return self._result(spec, STATUS_FAILED, ERROR_IO_ERROR)
         if raced_keys:
             # L1 dropped at least one written object while the store was in
-            # flight; publishing completeness now would advertise a payload the
-            # storage no longer holds (the fatal warm-load path).
-            self._counters["store_race_hits"] += 1
-            self._counters["store_race_rollbacks"] += len(raced_keys)
+            # flight; publishing completeness would advertise a payload the
+            # storage no longer holds.
             logger.debug(
                 "resource-block store for %s raced with L1 deletion of %d key(s);"
                 " completeness markers rolled back",
@@ -558,30 +597,6 @@ class ResourceBlockModule(DiscoverableModule):
                 len(raced_keys),
             )
             return self._result(spec, STATUS_FAILED, ERROR_IO_ERROR)
-        with self._lock:
-            completeness = self._completeness_for(state, spec.stock_key)
-            if resource.storage_kind == "boundary_state":
-                table = completeness.boundaries
-                marker = (spec.prefix_end, chunk_hashes[marker_hash_index])
-            else:
-                table = completeness.tokens
-                marker = chunk_hashes[marker_hash_index]
-            # Record completeness for every rank the write covered: the stock
-            # lookup key has no worker id and therefore requires all ranks.
-            for rank in ranks:
-                table.setdefault((spec.resource_id, rank), set()).add(marker)
-            # Keep the reverse index so an L1 eviction/clear can retire the
-            # marker together with the object that backs it.  Token keys are
-            # shared by every registration that stored the same chunk, so the
-            # index keeps each of their owners instead of the last writer.
-            self._remember_key_owners(
-                keys,
-                ranks,
-                completeness_key,
-                spec.resource_id,
-                marker,
-            )
-            self._counters["blocks_stored"] += 1
         return self._result(spec, STATUS_OK, "")
 
     @request_handler(HandlerType.BLOCKING)
@@ -808,9 +823,12 @@ class ResourceBlockModule(DiscoverableModule):
     def _close_store_window(self, keys: list[Any]) -> set[Any]:
         """Close the in-flight window and return keys deleted during it.
 
-        The caller holds ``self._lock``.  Tombstones are cleared once the last
-        in-flight store for the key finishes, so a later store of a new object
-        under the same key can publish its markers again.
+        The caller holds ``self._lock``.  The key stays registered (with a zero
+        count) until ``_finish_store_window`` so a deletion notification
+        delivered in the same critical section -- after this method returns but
+        before the marker publication -- is still recorded as a tombstone.
+        Tombstones therefore survive this call and are only consumed by
+        ``_finish_store_window``.
         """
         deleted: set[Any] = set()
         for key in dict.fromkeys(keys):
@@ -818,12 +836,22 @@ class ResourceBlockModule(DiscoverableModule):
             if remaining > 0:
                 self._pending_store_counts[key] = remaining
             else:
-                self._pending_store_counts.pop(key, None)
+                self._pending_store_counts[key] = 0
             if key in self._pending_deletions:
                 deleted.add(key)
-                if key not in self._pending_store_counts:
-                    self._pending_deletions.discard(key)
         return deleted
+
+    def _finish_store_window(self, keys: list[Any]) -> None:
+        """Consume the window state once the store outcome is decided.
+
+        The caller holds ``self._lock``.  Zero-count keys and their tombstones
+        are removed here, after the publication decision, so a later store of a
+        new object under the same key can publish markers again.
+        """
+        for key in dict.fromkeys(keys):
+            if self._pending_store_counts.get(key, 0) <= 0:
+                self._pending_store_counts.pop(key, None)
+                self._pending_deletions.discard(key)
 
     def _filter_key_owners(self) -> dict[Any, set[tuple]]:
         """Drop key owners whose completeness row was replaced or removed."""
