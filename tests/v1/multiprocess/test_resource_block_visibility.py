@@ -486,3 +486,38 @@ def test_rpc_payloads_roundtrip_through_msgspec():
     )
     assert decoded_spec.stock_key == key
     assert decoded_spec.block_ids == (0,)
+
+
+def _distinct_tokens(count: int, base: int = 7000) -> bytes:
+    return b"".join(struct.pack(">I", base + index) for index in range(count))
+
+
+def test_same_chunk_index_for_different_tokens_is_written():
+    """t37: completeness is content-addressed, not chunk-index addressed."""
+    module, _ = _module()
+    first = _key(_tokens(TOKENS))
+    first_spec = _spec(first, RESOURCES[0], start=0, end=CHUNK)
+    assert module.store_resource_block(first_spec, _token_payload(RESOURCES[0])).status == STATUS_OK
+
+    other = _key(_distinct_tokens(TOKENS), request_id="r2")
+    other_spec = _spec(other, RESOURCES[0], start=0, end=CHUNK)
+    result = module.store_resource_block(other_spec, _token_payload(RESOURCES[0]))
+    assert result.status == STATUS_OK
+    assert result.error_code == ""
+    assert module._counters["blocks_stored"] == 2
+
+
+def test_visible_prefix_is_scoped_to_the_request_prefix():
+    """t37: a stored prefix must not advertise a different token prefix."""
+    module, _ = _module()
+    stored = _key(_tokens(TOKENS))
+    for resource_id in RESOURCES:
+        module.store_resource_block(
+            _spec(stored, resource_id, start=0, end=CHUNK),
+            _token_payload(resource_id),
+        )
+    _store_boundary(module, stored, CHUNK)
+    assert _lookup(module, stored, TOKENS).prefix_end == CHUNK
+
+    unseen = _key(_distinct_tokens(TOKENS), request_id="r2")
+    assert _lookup(module, unseen, TOKENS).prefix_end == 0

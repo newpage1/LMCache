@@ -192,12 +192,17 @@ class _Registration:
 class _Completeness:
     """Committed blocks of one registration identity.
 
-    ``tokens[(resource_id, rank)]`` holds committed chunk indices and
-    ``boundaries[(resource_id, rank)]`` holds committed logical endpoints.
+    ``tokens[(resource_id, rank)]`` holds the content hash of every committed
+    chunk and ``boundaries[(resource_id, rank)]`` holds ``(endpoint, hash)``
+    pairs, where the hash is the chunk hash covering the endpoint.  Both are
+    content-addressed: two requests that happen to write the same chunk index
+    for different tokens must not make each other look present.
     """
 
-    tokens: dict[tuple[str, int], set[int]] = field(default_factory=dict)
-    boundaries: dict[tuple[str, int], set[int]] = field(default_factory=dict)
+    tokens: dict[tuple[str, int], set[bytes]] = field(default_factory=dict)
+    boundaries: dict[tuple[str, int], set[tuple[int, bytes]]] = field(
+        default_factory=dict
+    )
 
 
 class ResourceBlockModule(DiscoverableModule):
@@ -390,16 +395,25 @@ class ResourceBlockModule(DiscoverableModule):
         chunk_index = chunk_start // self._chunk_size
         ranks = _lookup_kv_ranks(spec.stock_key)
         chunk_hashes = self._chunk_hashes(spec.stock_key)
-        if chunk_index >= len(chunk_hashes) and resource.storage_kind != "boundary_state":
-            return self._result(spec, STATUS_FAILED, ERROR_INVALID_SPEC)
+        if resource.storage_kind == "boundary_state":
+            # A boundary completes the chunk ending at ``prefix_end``; use that
+            # chunk's content hash so two requests with different prefixes do
+            # not share an endpoint marker.
+            marker_hash_index = chunk_index - 1
+            if marker_hash_index < 0 or marker_hash_index >= len(chunk_hashes):
+                return self._result(spec, STATUS_FAILED, ERROR_INVALID_SPEC)
+        else:
+            marker_hash_index = chunk_index
+            if marker_hash_index >= len(chunk_hashes):
+                return self._result(spec, STATUS_FAILED, ERROR_INVALID_SPEC)
         with self._lock:
             completeness = self._completeness_for(state, spec.stock_key)
             if resource.storage_kind == "boundary_state":
                 table = completeness.boundaries
-                marker = spec.prefix_end
+                marker = (spec.prefix_end, chunk_hashes[marker_hash_index])
             else:
                 table = completeness.tokens
-                marker = chunk_index
+                marker = chunk_hashes[marker_hash_index]
             # A fanout stock key writes the same payload to every rank key, so
             # the block is only a duplicate when *every* rank already has it.
             if all(
@@ -429,10 +443,10 @@ class ResourceBlockModule(DiscoverableModule):
             completeness = self._completeness_for(state, spec.stock_key)
             if resource.storage_kind == "boundary_state":
                 table = completeness.boundaries
-                marker = spec.prefix_end
+                marker = (spec.prefix_end, chunk_hashes[marker_hash_index])
             else:
                 table = completeness.tokens
-                marker = chunk_index
+                marker = chunk_hashes[marker_hash_index]
             # Record completeness for every rank the write covered: the stock
             # lookup key has no worker id and therefore requires all ranks.
             for rank in ranks:
@@ -704,15 +718,16 @@ class ResourceBlockModule(DiscoverableModule):
         best = 0
         for chunk in range(chunks):
             endpoint = (chunk + 1) * self._chunk_size
+            chunk_hash = chunk_hashes[chunk]
             if not all(
-                chunk
+                chunk_hash
                 in completeness.tokens.get((resource.resource_id, rank), set())
                 for resource in token_resources
                 for rank in ranks
             ):
                 break
             if boundary_resources and not all(
-                endpoint
+                (endpoint, chunk_hash)
                 in completeness.boundaries.get(
                     (resource.resource_id, rank), set()
                 )
