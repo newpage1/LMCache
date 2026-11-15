@@ -29,6 +29,7 @@ import torch
 from lmcache.logging import init_logger
 from lmcache.v1.distributed.api import MemoryLayoutDesc, _lookup_kv_ranks
 from lmcache.v1.distributed.error import L1Error
+from lmcache.v1.distributed.internal_api import L1ManagerListener
 from lmcache.v1.multiprocess.engine_module import (
     DiscoverableModule,
     EngineModule,
@@ -205,6 +206,42 @@ class _Completeness:
     )
 
 
+class _CompletenessListener(L1ManagerListener):
+    """Drop completeness markers when their stock objects leave L1.
+
+    ``StorageManager.clear`` (the ``reset_external`` path) and LRU eviction
+    delete objects behind this module's back.  The completeness index must
+    follow those deletions, otherwise ``visible_prefix`` keeps advertising a
+    prefix whose payloads are gone and the next load fails inside the model
+    forward, where vLLM cannot recover a synchronous load.
+    """
+
+    def __init__(self, module: "ResourceBlockModule") -> None:
+        self._module = module
+
+    def on_l1_keys_reserved_read(self, keys) -> None:
+        """No-op: read reservations do not change completeness."""
+
+    def on_l1_keys_read_finished(self, keys) -> None:
+        """No-op: reads do not change completeness."""
+
+    def on_l1_keys_reserved_write(self, keys) -> None:
+        """No-op: writes become complete at ``finish_write``."""
+
+    def on_l1_keys_write_finished(self, keys) -> None:
+        """No-op: stores record completeness explicitly."""
+
+    def on_l1_keys_finish_write_and_reserve_read(self, keys) -> None:
+        """No-op: stores record completeness explicitly."""
+
+    def on_l1_keys_deleted_by_manager(self, keys) -> None:
+        """Invalidate every marker whose object was deleted."""
+        self._module.on_l1_keys_deleted(keys)
+
+    def on_l1_keys_accessed(self, keys) -> None:
+        """No-op: access does not change completeness."""
+
+
 class ResourceBlockModule(DiscoverableModule):
     """Serve ``register_resource_blocks`` and the per-block RPC operations."""
 
@@ -231,6 +268,10 @@ class ResourceBlockModule(DiscoverableModule):
         self._lock = threading.RLock()
         self._registrations: dict[str, _Registration] = {}
         self._completeness: dict[tuple, _Completeness] = {}
+        # Reverse index from a stock object key to the completeness marker it
+        # backs.  L1 eviction/clear deletes objects without calling this
+        # module, so the deletion listener uses this index to retire markers.
+        self._key_owners: dict[Any, tuple[tuple, str, int, object]] = {}
         self._next_generation = 1
         self._closed = False
         self._counters = {
@@ -238,8 +279,28 @@ class ResourceBlockModule(DiscoverableModule):
             "blocks_stored": 0,
             "blocks_already_present": 0,
             "blocks_retrieved": 0,
+            "blocks_invalidated": 0,
             "lookups": 0,
         }
+        self._register_l1_listeners()
+
+    def _register_l1_listeners(self) -> None:
+        """Observe L1 deletions so completeness cannot outlive its payloads."""
+        managers = getattr(self._ctx.storage_manager, "l1_managers", None)
+        if not callable(managers):
+            return
+        for manager in managers():
+            register = getattr(manager, "register_listener", None)
+            if not callable(register):
+                continue
+            try:
+                register(_CompletenessListener(self))
+            except Exception:  # noqa: BLE001 - visibility is best effort
+                logger.warning(
+                    "resource-block module could not observe L1 deletions on %r",
+                    manager,
+                    exc_info=True,
+                )
 
     # ------------------------------------------------------------------
     # EngineModule
@@ -330,6 +391,11 @@ class ResourceBlockModule(DiscoverableModule):
                 key: value
                 for key, value in self._completeness.items()
                 if key[0] != registration.instance_id
+            }
+            self._key_owners = {
+                key: owner
+                for key, owner in self._key_owners.items()
+                if owner[0] in self._completeness
             }
             self._counters["registered"] += 1
             return self._ack(state)
@@ -441,6 +507,7 @@ class ResourceBlockModule(DiscoverableModule):
             return self._result(spec, STATUS_FAILED, ERROR_IO_ERROR)
         with self._lock:
             completeness = self._completeness_for(state, spec.stock_key)
+            completeness_key = self._completeness_key(state, spec.stock_key)
             if resource.storage_kind == "boundary_state":
                 table = completeness.boundaries
                 marker = (spec.prefix_end, chunk_hashes[marker_hash_index])
@@ -451,6 +518,15 @@ class ResourceBlockModule(DiscoverableModule):
             # lookup key has no worker id and therefore requires all ranks.
             for rank in ranks:
                 table.setdefault((spec.resource_id, rank), set()).add(marker)
+            # Keep the reverse index so an L1 eviction/clear can retire the
+            # marker together with the object that backs it.
+            for key, rank in zip(keys, ranks):
+                self._key_owners[key] = (
+                    completeness_key,
+                    spec.resource_id,
+                    rank,
+                    marker,
+                )
             self._counters["blocks_stored"] += 1
         return self._result(spec, STATUS_OK, "")
 
@@ -661,11 +737,11 @@ class ResourceBlockModule(DiscoverableModule):
             raise _SpecError(ERROR_INVALID_SPEC)
         return state
 
-    def _completeness_for(
+    def _completeness_key(
         self, state: _Registration, stock_key: "IPCCacheServerKey"
-    ) -> _Completeness:
+    ) -> tuple:
         registration = state.registration
-        key = (
+        return (
             registration.instance_id,
             registration.plan_hash,
             registration.layout_hash,
@@ -673,11 +749,48 @@ class ResourceBlockModule(DiscoverableModule):
             int(stock_key.world_size),
             stock_key.cache_salt,
         )
+
+    def _completeness_for(
+        self, state: _Registration, stock_key: "IPCCacheServerKey"
+    ) -> _Completeness:
+        key = self._completeness_key(state, stock_key)
         completeness = self._completeness.get(key)
         if completeness is None:
             completeness = _Completeness()
             self._completeness[key] = completeness
         return completeness
+
+    def on_l1_keys_deleted(self, keys: list[Any]) -> None:
+        """Retire completeness markers whose L1 objects were deleted.
+
+        Called by the L1 manager listener on eviction, explicit deletion and
+        CLEAR (including ``reset_external``).  Without this hook the module
+        keeps advertising payloads the storage no longer holds, which turns a
+        prefix hit into a load failure inside the model forward.
+        """
+        with self._lock:
+            for key in keys:
+                owner = self._key_owners.pop(key, None)
+                if owner is None:
+                    continue
+                completeness_key, resource_id, rank, marker = owner
+                completeness = self._completeness.get(completeness_key)
+                if completeness is None:
+                    continue
+                table = (
+                    completeness.boundaries
+                    if isinstance(marker, tuple)
+                    else completeness.tokens
+                )
+                entries = table.get((resource_id, rank))
+                if entries is None:
+                    continue
+                entries.discard(marker)
+                if not entries:
+                    table.pop((resource_id, rank), None)
+                if not completeness.tokens and not completeness.boundaries:
+                    self._completeness.pop(completeness_key, None)
+                self._counters["blocks_invalidated"] += 1
 
     def _candidate_states(
         self, request: ResourceBlockLookupRequest

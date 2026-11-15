@@ -86,6 +86,23 @@ class FakeMemoryObj:
 class FakeL1:
     def __init__(self, storage) -> None:
         self._storage = storage
+        self._listeners = []
+
+    def register_listener(self, listener) -> None:
+        self._listeners.append(listener)
+
+    def _notify_deleted(self, keys) -> None:
+        for listener in self._listeners:
+            listener.on_l1_keys_deleted_by_manager(keys)
+
+    def clear(self, force: bool = False) -> None:
+        keys = list(self._storage)
+        self._storage.clear()
+        self._notify_deleted(keys)
+
+    def delete_keys(self, keys) -> None:
+        deleted = [key for key in keys if self._storage.pop(key, None) is not None]
+        self._notify_deleted(deleted)
 
     def reserve_read(self, keys):
         result = {}
@@ -107,6 +124,7 @@ class FakeStorageManager:
     def __init__(self) -> None:
         self.data: dict[object, bytes] = {}
         self.reserved: dict[object, FakeMemoryObj] = {}
+        self._l1 = FakeL1(self.data)
 
     def reserve_write(self, keys, layout_desc):
         result = {}
@@ -122,7 +140,13 @@ class FakeStorageManager:
             self.data[key] = self.reserved.pop(key).tensor.numpy().tobytes()
 
     def l1_managers(self):
-        return [FakeL1(self.data)]
+        return [self._l1]
+
+    def clear(self, force: bool = False) -> None:
+        self._l1.clear(force=force)
+
+    def delete_keys(self, keys) -> None:
+        self._l1.delete_keys(keys)
 
 
 @dataclass
@@ -521,3 +545,48 @@ def test_visible_prefix_is_scoped_to_the_request_prefix():
 
     unseen = _key(_distinct_tokens(TOKENS), request_id="r2")
     assert _lookup(module, unseen, TOKENS).prefix_end == 0
+
+
+def test_clear_retires_completeness_markers():
+    """t56: CLEAR/reset_external must not leave a visible but empty prefix."""
+    module, ctx = _module()
+    key = _key(_tokens(TOKENS))
+    _store_chunk(module, key, 0)
+    _store_chunk(module, key, 1)
+    _store_boundary(module, key, 2 * CHUNK)
+    assert module.stock_visible_chunks(key, 2, CHUNK) == 2
+
+    ctx.storage_manager.clear(force=False)
+
+    assert module.stock_visible_chunks(key, 2, CHUNK) == 0
+    result, payload = module.retrieve_resource_block(
+        _spec(key, RESOURCES[0], direction="load", start=0, end=CHUNK)
+    )
+    assert result.status == STATUS_MISS
+    assert payload == b""
+    assert module.report_status()["blocks_invalidated"] > 0
+
+    # A re-store after the clear becomes visible again from scratch.
+    _store_chunk(module, key, 0)
+    assert module.stock_visible_chunks(key, 1, CHUNK) == 0
+    _store_boundary(module, key, CHUNK)
+    assert module.stock_visible_chunks(key, 1, CHUNK) == 1
+
+
+def test_evicting_one_token_key_drops_only_its_marker():
+    """t56: LRU eviction invalidates exactly the deleted object's marker."""
+    module, ctx = _module()
+    key = _key(_tokens(TOKENS))
+    _store_chunk(module, key, 0)
+    _store_chunk(module, key, 1)
+    _store_boundary(module, key, 2 * CHUNK)
+    assert module.stock_visible_chunks(key, 2, CHUNK) == 2
+
+    victim = next(iter(ctx.storage_manager.data))
+    ctx.storage_manager.delete_keys([victim])
+
+    assert module.stock_visible_chunks(key, 2, CHUNK) < 2
+
+    ctx.storage_manager.clear(force=True)
+    assert module.stock_visible_chunks(key, 2, CHUNK) == 0
+
