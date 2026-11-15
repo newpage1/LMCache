@@ -278,6 +278,15 @@ class ResourceBlockModule(DiscoverableModule):
         # A last-writer slot would let one eviction leave the other
         # registrations advertising a payload the storage no longer has.
         self._key_owners: dict[Any, set[tuple]] = {}
+        # In-flight store windows.  A store registers the object keys it is
+        # about to write *before* the payload can become visible, and closes
+        # the window after the write.  The deletion listener runs under the
+        # same lock, so an eviction that happens while the write is in flight
+        # is recorded in ``_pending_deletions`` and the store abandons its
+        # completeness markers instead of publishing them after the payload is
+        # already gone.
+        self._pending_store_counts: dict[Any, int] = {}
+        self._pending_deletions: set[Any] = set()
         self._next_generation = 1
         self._closed = False
         self._counters = {
@@ -287,6 +296,8 @@ class ResourceBlockModule(DiscoverableModule):
             "blocks_retrieved": 0,
             "blocks_invalidated": 0,
             "lookups": 0,
+            "store_race_hits": 0,
+            "store_race_rollbacks": 0,
         }
         self._register_l1_listeners()
 
@@ -406,7 +417,13 @@ class ResourceBlockModule(DiscoverableModule):
     def store_resource_block(
         self, spec: ResourceBlockSpec, payload: bytes
     ) -> ResourceBlockResult:
-        """Store one opaque block and make it visible to the stock lookup."""
+        """Store one opaque block and make it visible to the stock lookup.
+
+        The write opens an in-flight key window that the L1 deletion listener
+        observes: if the object is evicted or cleared before the write returns,
+        the completeness markers are rolled back and the store reports an IO
+        failure instead of advertising a dead payload.
+        """
         try:
             state = self._validate_spec(spec, direction="store")
         except _SpecError as error:
@@ -512,16 +529,37 @@ class ResourceBlockModule(DiscoverableModule):
                     marker,
                 )
                 return self._result(spec, STATUS_OK, ERROR_ALREADY_PRESENT)
+            completeness_key = self._completeness_key(state, spec.stock_key)
+            self._open_store_window(keys)
+        write_failed = False
         try:
             for key in keys:
                 if not self._store.write(key, payload):
-                    return self._result(spec, STATUS_FAILED, ERROR_IO_ERROR)
+                    write_failed = True
+                    break
         except Exception:  # noqa: BLE001 - surfaced as an IO failure result
             logger.exception("resource-block store failed for %s", spec.resource_id)
+            write_failed = True
+        finally:
+            with self._lock:
+                raced_keys = self._close_store_window(keys)
+        if write_failed:
+            return self._result(spec, STATUS_FAILED, ERROR_IO_ERROR)
+        if raced_keys:
+            # L1 dropped at least one written object while the store was in
+            # flight; publishing completeness now would advertise a payload the
+            # storage no longer holds (the fatal warm-load path).
+            self._counters["store_race_hits"] += 1
+            self._counters["store_race_rollbacks"] += len(raced_keys)
+            logger.debug(
+                "resource-block store for %s raced with L1 deletion of %d key(s);"
+                " completeness markers rolled back",
+                spec.resource_id,
+                len(raced_keys),
+            )
             return self._result(spec, STATUS_FAILED, ERROR_IO_ERROR)
         with self._lock:
             completeness = self._completeness_for(state, spec.stock_key)
-            completeness_key = self._completeness_key(state, spec.stock_key)
             if resource.storage_kind == "boundary_state":
                 table = completeness.boundaries
                 marker = (spec.prefix_end, chunk_hashes[marker_hash_index])
@@ -753,6 +791,40 @@ class ResourceBlockModule(DiscoverableModule):
             raise _SpecError(ERROR_INVALID_SPEC)
         return state
 
+    def _open_store_window(self, keys: list[Any]) -> None:
+        """Register in-flight object keys before their payload becomes visible.
+
+        The caller holds ``self._lock``.  A deletion notification delivered
+        while the write is in flight marks the key in
+        ``_pending_deletions``; ``_close_store_window`` reports it back so the
+        store does not publish completeness for an object the L1 already
+        dropped.
+        """
+        for key in keys:
+            self._pending_store_counts[key] = (
+                self._pending_store_counts.get(key, 0) + 1
+            )
+
+    def _close_store_window(self, keys: list[Any]) -> set[Any]:
+        """Close the in-flight window and return keys deleted during it.
+
+        The caller holds ``self._lock``.  Tombstones are cleared once the last
+        in-flight store for the key finishes, so a later store of a new object
+        under the same key can publish its markers again.
+        """
+        deleted: set[Any] = set()
+        for key in dict.fromkeys(keys):
+            remaining = self._pending_store_counts.get(key, 0) - 1
+            if remaining > 0:
+                self._pending_store_counts[key] = remaining
+            else:
+                self._pending_store_counts.pop(key, None)
+            if key in self._pending_deletions:
+                deleted.add(key)
+                if key not in self._pending_store_counts:
+                    self._pending_deletions.discard(key)
+        return deleted
+
     def _filter_key_owners(self) -> dict[Any, set[tuple]]:
         """Drop key owners whose completeness row was replaced or removed."""
         owners_by_key: dict[Any, set[tuple]] = {}
@@ -819,6 +891,11 @@ class ResourceBlockModule(DiscoverableModule):
         """
         with self._lock:
             for key in keys:
+                if key in self._pending_store_counts:
+                    # The store has not published its markers yet.  Record
+                    # the deletion so it can roll them back when it returns
+                    # instead of advertising a payload that is already gone.
+                    self._pending_deletions.add(key)
                 owners = self._key_owners.pop(key, None)
                 if not owners:
                     continue
