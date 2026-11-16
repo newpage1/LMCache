@@ -19,6 +19,7 @@ import zmq
 # First Party
 from lmcache.logging import init_logger
 from lmcache.v1.distributed.api import MemoryLayoutDesc
+from lmcache.v1.multiprocess import lw_v3_trace
 from lmcache.v1.multiprocess.affinity_pool import AffinityThreadPool
 from lmcache.v1.multiprocess.custom_types import (
     DeviceIPCWrapper,
@@ -57,6 +58,16 @@ def encode_request_uid(uid: RequestUID) -> bytes:
 
 def decode_request_uid(b_uid: bytes) -> RequestUID:
     return msgspec.msgpack.decode(b_uid, type=RequestUID)
+
+
+def _trace_unavailable_fields() -> dict[str, str]:
+    """Fields a transport span cannot obtain; recorded as unavailable, not 0."""
+    return {
+        "request_id": "unavailable",
+        "step_id": "unavailable",
+        "group_id": "unavailable",
+        "batch_id": "unavailable",
+    }
 
 
 def unwrap_request_payloads(
@@ -326,6 +337,10 @@ class MessageQueueClient:
             int, tuple[MessagingStream[Any], RpcSpec, queue.Queue]
         ] = {}
 
+        # W1a trace: submit timestamp per request uid (the dict stays empty
+        # unless the default-off mask-trace sink is enabled).
+        self._trace_submit_ns: dict[int, int] = {}
+
         # Register with the shared polling loop
         self._polling_loop = ClientPollingLoop.get_instance()
         self._polling_loop.register(self)
@@ -395,6 +410,59 @@ class MessageQueueClient:
         except queue.Empty:
             pass
 
+    def _emit_client_wait(
+        self,
+        submit_ns: int,
+        request_uid: int,
+        b_operation: bytes,
+        b_response: list[bytes],
+    ) -> None:
+        """Emit the submit -> future-set span for one response."""
+        lw_v3_trace.emit(
+            "client",
+            "client_rpc_wait",
+            elapsed_ns=max(0, lw_v3_trace.now_ns() - submit_ns),
+            rpc_request_uid=request_uid,
+            operation=decode_operation(b_operation),
+            bytes=len(b_response[0]) if b_response else 0,
+            request_id=None,
+            step_id=None,
+            group_id=None,
+            batch_id=None,
+            field_status=_trace_unavailable_fields(),
+        )
+
+    def _emit_client_decode(
+        self,
+        decode_start_ns: int,
+        request_uid: int,
+        operation: str,
+        response: Any,
+        response_bytes: int,
+    ) -> None:
+        """Emit the response msgspec-decode span for one response."""
+        batch_id = getattr(response, "batch_id", None)
+        status = getattr(response, "status", None)
+        if batch_id is None and isinstance(response, tuple) and response:
+            batch_id = getattr(response[0], "batch_id", None)
+            status = getattr(response[0], "status", None)
+        field_status = _trace_unavailable_fields()
+        if batch_id is None:
+            field_status["batch_id"] = "unavailable"
+        if status is None:
+            field_status["status"] = "unavailable"
+        lw_v3_trace.emit(
+            "client",
+            "client_response_decode",
+            elapsed_ns=max(0, lw_v3_trace.now_ns() - decode_start_ns),
+            rpc_request_uid=request_uid,
+            operation=operation,
+            batch_id=batch_id,
+            status=status,
+            bytes=response_bytes,
+            field_status=field_status,
+        )
+
     def process_inbound(self) -> None:
         """Process one inbound response from the server.
 
@@ -412,6 +480,11 @@ class MessageQueueClient:
             return
         b_request_uid, b_operation, *b_response = msg
         request_uid = msgspec_decode(b_request_uid, cls=RequestUID)
+        trace_submit_ns = self._trace_submit_ns.pop(request_uid, None)
+        if trace_submit_ns is not None:
+            self._emit_client_wait(
+                trace_submit_ns, request_uid, b_operation, b_response
+            )
 
         if request_uid in self.pending_streams:
             stream, rpc_spec, responses = self.pending_streams[request_uid]
@@ -421,8 +494,17 @@ class MessageQueueClient:
                     or not b_response
                 ):
                     raise ConnectionError("Event subscription ended")
+                decode_start = lw_v3_trace.start()
                 response = msgspec_decode(b_response[0], cls=rpc_spec.response_type)
                 responses.put_nowait(response)
+                if decode_start is not None:
+                    self._emit_client_decode(
+                        decode_start,
+                        request_uid,
+                        rpc_spec.operation,
+                        response,
+                        len(b_response[0]),
+                    )
             except Exception:
                 stream.close()
             return
@@ -453,8 +535,17 @@ class MessageQueueClient:
                 )
                 return
             if b_response:
+                decode_start = lw_v3_trace.start()
                 response = msgspec_decode(b_response[0], cls=rpc_spec.response_type)
                 future.set_result(response)
+                if decode_start is not None:
+                    self._emit_client_decode(
+                        decode_start,
+                        request_uid,
+                        operation,
+                        response,
+                        len(b_response[0]),
+                    )
             else:
                 future.set_result(None)
 
@@ -474,6 +565,9 @@ class MessageQueueClient:
         """
         rpc_spec = get_rpc_spec(operation)
         request_uid = next(self._request_counter)
+        trace_submit_ns = lw_v3_trace.start()
+        if trace_submit_ns is not None:
+            self._trace_submit_ns[request_uid] = trace_submit_ns
         responses: queue.Queue | None = None
         future: MessagingFuture[T] | MessagingStream[T]
         if rpc_spec.streaming:
@@ -596,11 +690,49 @@ class BlockingRequestHandler(RequestHandlerBase[ResponseType]):
             "Call add_normal_thread_pool or add_affinity_thread_pool first."
         )
         decoded_payloads = unwrap_request_payloads(payloads, self.payload_clss)
+        trace_params = getattr(self, "_lw_v3_trace", None)
+        if trace_params is not None:
+            self._lw_v3_trace = None
+            handler = self._traced_handler(trace_params)
+        else:
+            handler = self.handler
         if isinstance(self.executor, AffinityThreadPool):
             return self.executor.submit(
-                self.handler, *decoded_payloads, affinity_key=affinity_key
+                handler, *decoded_payloads, affinity_key=affinity_key
             )
-        return self.executor.submit(self.handler, *decoded_payloads)
+        return self.executor.submit(handler, *decoded_payloads)
+
+    def _traced_handler(
+        self, trace_params: dict[str, Any]
+    ) -> Callable[..., ResponseType]:
+        """Wrap the real handler with pool-start and handler-end spans."""
+        handler = self.handler
+
+        def _run(*args: Any, **kwargs: Any) -> ResponseType:
+            handler_start = lw_v3_trace.start()
+            if handler_start is not None:
+                lw_v3_trace.emit(
+                    "server",
+                    "server_pool_start",
+                    elapsed_ns=max(0, handler_start - trace_params["submit_ns"]),
+                    rpc_request_uid=trace_params["request_uid"],
+                    operation=trace_params["operation"],
+                    field_status=_trace_unavailable_fields(),
+                )
+            try:
+                return handler(*args, **kwargs)
+            finally:
+                if handler_start is not None:
+                    lw_v3_trace.emit(
+                        "server",
+                        "server_handler",
+                        elapsed_ns=max(0, lw_v3_trace.now_ns() - handler_start),
+                        rpc_request_uid=trace_params["request_uid"],
+                        operation=trace_params["operation"],
+                        field_status=_trace_unavailable_fields(),
+                    )
+
+        return _run
 
     def get_response_class(self) -> ResponseType:
         return self.response_cls
@@ -683,7 +815,18 @@ class MessageQueueServer(RequestServer):
             )
             return
         response_cls = handler_entry.get_response_class()
+        pack_start = lw_v3_trace.start()
         b_response = msgspec_encode(response, cls=response_cls)
+        if pack_start is not None:
+            lw_v3_trace.emit(
+                "server",
+                "server_pack",
+                elapsed_ns=max(0, lw_v3_trace.now_ns() - pack_start),
+                rpc_request_uid=decode_request_uid(prefix_frames[1]),
+                operation=decode_operation(prefix_frames[2]),
+                bytes=len(b_response),
+                field_status=_trace_unavailable_fields(),
+            )
         if response is not None:
             self.socket.send_multipart(prefix_frames + [b_response])
         else:
@@ -738,13 +881,31 @@ class MessageQueueServer(RequestServer):
                 prefix_frames[0] is the zmq identity used as affinity key.
         """
         affinity_key = hash(prefix_frames[0])
+        trace_submit_ns = lw_v3_trace.start()
+        if trace_submit_ns is not None:
+            handler_entry._lw_v3_trace = {
+                "submit_ns": trace_submit_ns,
+                "request_uid": decode_request_uid(prefix_frames[1]),
+                "operation": decode_operation(prefix_frames[2]),
+            }
         future = handler_entry(payloads, affinity_key=affinity_key)
 
         def _notify_response(fut: Future):
             try:
                 response = fut.result()
                 response_cls = handler_entry.get_response_class()
+                pack_start = lw_v3_trace.start()
                 b_response = msgspec_encode(response, cls=response_cls)
+                if pack_start is not None:
+                    lw_v3_trace.emit(
+                        "server",
+                        "server_pack",
+                        elapsed_ns=max(0, lw_v3_trace.now_ns() - pack_start),
+                        rpc_request_uid=decode_request_uid(prefix_frames[1]),
+                        operation=decode_operation(prefix_frames[2]),
+                        bytes=len(b_response),
+                        field_status=_trace_unavailable_fields(),
+                    )
                 frames_to_send = (
                     prefix_frames + [b_response]
                     if response is not None

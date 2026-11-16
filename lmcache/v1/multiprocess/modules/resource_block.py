@@ -36,6 +36,7 @@ from lmcache.v1.multiprocess.engine_module import (
     EngineModule,
     ModuleBuildContext,
 )
+from lmcache.v1.multiprocess import lw_v3_trace
 from lmcache.v1.multiprocess.layerwise import CacheTransferResource
 from lmcache.v1.multiprocess.request_handler import HandlerType, request_handler
 from lmcache.v1.multiprocess.resource_block_protocol import (
@@ -544,7 +545,7 @@ class ResourceBlockModule(DiscoverableModule):
 
         chunk_index = chunk_start // self._chunk_size
         ranks = _lookup_kv_ranks(spec.stock_key)
-        chunk_hashes = self._chunk_hashes(spec.stock_key)
+        chunk_hashes = self._chunk_hashes(spec.stock_key, purpose="store")
         if resource.storage_kind == "boundary_state":
             # A boundary completes the chunk ending at ``prefix_end``; use that
             # chunk's content hash so two requests with different prefixes do
@@ -558,7 +559,7 @@ class ResourceBlockModule(DiscoverableModule):
                 return self._result(spec, STATUS_FAILED, ERROR_INVALID_SPEC)
         if resource.storage_kind == "boundary_state":
             try:
-                keys = self._boundary_keys(spec, ranks)
+                keys = self._boundary_keys(spec, ranks, purpose="store")
             except _SpecError as error:
                 return self._result(spec, STATUS_FAILED, error.code)
         else:
@@ -695,13 +696,61 @@ class ResourceBlockModule(DiscoverableModule):
                 resource_id=spec.resource_id,
                 ranks=ranks,
             )
+        read_start = lw_v3_trace.start()
         try:
             payload = self._store.read(keys[0])
         except Exception:  # noqa: BLE001 - surfaced as an IO failure result
             logger.exception("resource-block retrieve failed for %s", spec.resource_id)
+            self._trace_emit(
+                "server_read",
+                read_start,
+                operation_id=spec.operation_id,
+                request_id=spec.request_id,
+                step_id=spec.step_id,
+                instance_id=spec.instance_id,
+                resource_id=spec.resource_id,
+                prefix_end=spec.prefix_end,
+                keys=1,
+                bytes=None,
+                status=STATUS_FAILED,
+                error_code=ERROR_IO_ERROR,
+                rank=None,
+                group_id=None,
+            )
             return self._result(spec, STATUS_FAILED, ERROR_IO_ERROR), b""
         if payload is None:
+            self._trace_emit(
+                "server_read",
+                read_start,
+                operation_id=spec.operation_id,
+                request_id=spec.request_id,
+                step_id=spec.step_id,
+                instance_id=spec.instance_id,
+                resource_id=spec.resource_id,
+                prefix_end=spec.prefix_end,
+                keys=1,
+                bytes=0,
+                status=STATUS_MISS,
+                error_code=ERROR_RESOURCE_MISSING,
+                rank=None,
+                group_id=None,
+            )
             return self._result(spec, STATUS_MISS, ERROR_RESOURCE_MISSING), b""
+        self._trace_emit(
+            "server_read",
+            read_start,
+            operation_id=spec.operation_id,
+            request_id=spec.request_id,
+            step_id=spec.step_id,
+            instance_id=spec.instance_id,
+            resource_id=spec.resource_id,
+            prefix_end=spec.prefix_end,
+            keys=1,
+            bytes=len(payload),
+            status=STATUS_OK,
+            rank=None,
+            group_id=None,
+        )
         self._counters["blocks_retrieved"] += 1
         return self._result(spec, STATUS_OK, ""), payload
 
@@ -730,10 +779,44 @@ class ResourceBlockModule(DiscoverableModule):
             A ``(result, payload_stream)`` pair; ``result.items`` points into
             ``payload_stream`` with ``offset``/``length``.
         """
+        trace_start = lw_v3_trace.start()
         try:
             state, ranks, chunk_hashes = self._validate_batch_request(request)
         except _SpecError as error:
+            self._trace_emit(
+                "server_validate_batch",
+                trace_start,
+                batch_id=request.batch_id,
+                instance_id=request.instance_id,
+                request_id=request.request_id,
+                step_id=request.step_id,
+                registration_epoch=request.registration_epoch,
+                server_generation=request.server_generation,
+                items=len(request.items),
+                chunks=None,
+                status=STATUS_INVALID,
+                error_code=error.code,
+                rank=None,
+                group_id=None,
+                operation_id=None,
+            )
             return self._batch_rejection(request, error.code), b""
+        self._trace_emit(
+            "server_validate_batch",
+            trace_start,
+            batch_id=request.batch_id,
+            instance_id=request.instance_id,
+            request_id=request.request_id,
+            step_id=request.step_id,
+            registration_epoch=request.registration_epoch,
+            server_generation=request.server_generation,
+            items=len(request.items),
+            chunks=len(chunk_hashes),
+            status=STATUS_OK,
+            rank=state.registration.worker_id,
+            group_id=None,
+            operation_id=None,
+        )
         keys: list[Any] = []
         outcomes: list[ResourceBlockBatchItemResult | None] = [None] * len(
             request.items
@@ -752,14 +835,22 @@ class ResourceBlockModule(DiscoverableModule):
         if expected_bytes > request.max_total_bytes:
             return self._batch_rejection(request, ERROR_INVALID_SPEC), b""
         payloads: list[bytes | None] = []
+        read_start = lw_v3_trace.start()
         if keys:
             try:
                 payloads = self._store.read_many(keys)
             except _BatchCancelled:
+                self._trace_batch_read(
+                    read_start, request, state, keys, None, ERROR_CANCELLED
+                )
                 return self._batch_read_error(request, outcomes, ERROR_CANCELLED)
             except Exception:  # noqa: BLE001 - surfaced as an IO failure result
                 logger.exception("resource-block batch retrieve failed")
+                self._trace_batch_read(
+                    read_start, request, state, keys, None, ERROR_IO_ERROR
+                )
                 return self._batch_read_error(request, outcomes, ERROR_IO_ERROR)
+            self._trace_batch_read(read_start, request, state, keys, payloads, "")
         stream = bytearray()
         results: list[ResourceBlockBatchItemResult] = []
         payload_index = 0
@@ -794,6 +885,30 @@ class ResourceBlockModule(DiscoverableModule):
             )
         if retrieved:
             self._counters["blocks_retrieved"] += retrieved
+        batch_status = self._batch_status(results)
+        self._trace_emit(
+            "server_batch_result",
+            trace_start,
+            batch_id=request.batch_id,
+            instance_id=request.instance_id,
+            request_id=request.request_id,
+            step_id=request.step_id,
+            registration_epoch=request.registration_epoch,
+            server_generation=request.server_generation,
+            items=len(results),
+            ok=sum(1 for item in results if item.status == STATUS_OK),
+            miss=sum(1 for item in results if item.status == STATUS_MISS),
+            invalid=sum(1 for item in results if item.status == STATUS_INVALID),
+            failed=sum(1 for item in results if item.status == STATUS_FAILED),
+            bytes=len(stream),
+            status=batch_status,
+            rank=state.registration.worker_id,
+            group_id=None,
+            operation_id=None,
+            # Comma-joined item ids let an offline join map every server span
+            # back to the individual operations a client submitted.
+            operation_ids=",".join(item.operation_id for item in results),
+        )
         return (
             ResourceBlockBatchResult(
                 batch_id=request.batch_id,
@@ -802,7 +917,7 @@ class ResourceBlockModule(DiscoverableModule):
                 server_generation=request.server_generation,
                 plan_hash=request.plan_hash,
                 layout_hash=request.layout_hash,
-                status=self._batch_status(results),
+                status=batch_status,
                 total_bytes=len(stream),
                 items=tuple(results),
             ),
@@ -1041,7 +1156,7 @@ class ResourceBlockModule(DiscoverableModule):
         chunks = (end + chunk_size - 1) // chunk_size
         if chunks <= 0 or chunks > RESOURCE_BLOCK_BATCH_MAX_CHUNKS:
             raise _SpecError(ERROR_INVALID_SPEC)
-        return state, ranks, self._chunk_hashes(request.stock_key)
+        return state, ranks, self._chunk_hashes(request.stock_key, purpose="retrieval")
 
     def _batch_item_key(
         self,
@@ -1333,7 +1448,7 @@ class ResourceBlockModule(DiscoverableModule):
     ) -> int:
         key = request.stock_key
         completeness = self._completeness_for(state, key)
-        chunk_hashes = self._chunk_hashes(key)
+        chunk_hashes = self._chunk_hashes(key, purpose="visibility")
         chunks = min(len(chunk_hashes), request.limit // self._chunk_size)
         if chunks <= 0:
             return 0
@@ -1371,15 +1486,116 @@ class ResourceBlockModule(DiscoverableModule):
             best = endpoint
         return min(best, request.limit)
 
-    def _chunk_hashes(self, key: "IPCCacheServerKey") -> list[bytes]:
-        return self._ctx.token_hasher.compute_packed_chunk_hashes(
-            key.token_bytes, end=key.end
+    def _chunk_hashes(
+        self, key: "IPCCacheServerKey", *, purpose: str = "retrieval"
+    ) -> list[bytes]:
+        """Compute the stock chunk hashes once, optionally tracing the span.
+
+        ``purpose`` keeps retrieval hashes separate from lookup/visibility and
+        store hashes so G1 can reconcile per-stage call counts.  Tracing is a
+        no-op (no clock read) when the default-off sink is disabled.
+
+        Args:
+            key: Stock cache key whose token bytes are hashed.
+            purpose: ``retrieval``, ``store`` or ``visibility``.
+
+        Returns:
+            One packed chunk hash per chunk in ``key``.
+        """
+        compute = self._ctx.token_hasher.compute_packed_chunk_hashes
+        if not lw_v3_trace.enabled():
+            return compute(key.token_bytes, end=key.end)
+        start = lw_v3_trace.start()
+        chunk_hashes = compute(key.token_bytes, end=key.end)
+        self._trace_emit(
+            "server_hash",
+            start,
+            purpose=purpose,
+            chunks=len(chunk_hashes),
+            request_id=key.request_id,
+            step_id=None,
+            group_id=None,
+            prefix_end=key.end,
+            bytes=len(key.token_bytes),
+            model_name=key.model_name,
+            world_size=key.world_size,
+            worker_id=key.worker_id,
+            rank=None,
+            instance_id=None,
+            batch_id=None,
+            operation_id=None,
+        )
+        return chunk_hashes
+
+    @staticmethod
+    def _trace_emit(event: str, start_ns: int | None, **fields: Any) -> None:
+        """Emit one server span, marking null fields as unavailable.
+
+        Args:
+            event: Stable span name.
+            start_ns: ``lw_v3_trace.start()`` value; ``None`` disables emit.
+            **fields: Flat scalar fields; ``None`` is recorded as null and
+                listed in ``field_status`` as ``unavailable``.
+        """
+        if start_ns is None:
+            return
+        field_status = {
+            name: "unavailable" for name, value in fields.items() if value is None
+        }
+        lw_v3_trace.emit(
+            "server",
+            event,
+            elapsed_ns=lw_v3_trace.elapsed_since(start_ns),
+            field_status=field_status,
+            **fields,
         )
 
-    def _boundary_keys(self, spec: ResourceBlockSpec, ranks: list[int]) -> list[Any]:
+    def _trace_batch_read(
+        self,
+        start_ns: int | None,
+        request: ResourceBlockBatchRequest,
+        state: _Registration,
+        keys: list[Any],
+        payloads: list[bytes | None] | None,
+        error_code: str,
+    ) -> None:
+        """Emit the batch read reservation/copy span."""
+        if start_ns is None:
+            return
+        readable = 0
+        byte_count = 0
+        if payloads is not None:
+            byte_count = sum(
+                len(payload) for payload in payloads if payload is not None
+            )
+            readable = sum(1 for payload in payloads if payload is not None)
+        self._trace_emit(
+            "server_read",
+            start_ns,
+            batch_id=request.batch_id,
+            instance_id=request.instance_id,
+            request_id=request.request_id,
+            step_id=request.step_id,
+            registration_epoch=request.registration_epoch,
+            server_generation=request.server_generation,
+            keys=len(keys),
+            hits=readable,
+            bytes=None if payloads is None else byte_count,
+            status=STATUS_OK if not error_code else STATUS_FAILED,
+            error_code=error_code or None,
+            rank=state.registration.worker_id,
+            group_id=None,
+            operation_id=None,
+            resource_id=None,
+            prefix_end=None,
+        )
+
+    def _boundary_keys(
+        self, spec: ResourceBlockSpec, ranks: list[int], *, purpose: str = "retrieval"
+    ) -> list[Any]:
         if spec.prefix_end <= 0 or spec.prefix_end % self._chunk_size:
             raise _SpecError(ERROR_INVALID_SPEC)
-        chunk_hashes = self._chunk_hashes(spec.stock_key)
+        chunk_hashes = self._chunk_hashes(spec.stock_key, purpose=purpose)
         return self._boundary_object_keys(
             stock_key=spec.stock_key,
             plan_hash=spec.plan_hash,

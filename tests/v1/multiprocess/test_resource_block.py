@@ -8,6 +8,8 @@ that shape and the explicit partial/error outcomes.
 """
 
 # Standard
+import json
+import os
 import struct
 
 # Third Party
@@ -15,6 +17,7 @@ import msgspec
 import pytest
 
 # First Party
+from lmcache.v1.multiprocess import lw_v3_trace
 from lmcache.v1.multiprocess.modules import resource_block as resource_block_module
 from lmcache.v1.multiprocess.modules.resource_block import (
     ResourceBlockModule,
@@ -483,3 +486,35 @@ def test_batch_capability_is_advertised_in_the_registration_ack() -> None:
     ack = module.register_resource_blocks(_registration())
     assert "resource_blocks_batch_v1" in ack.capabilities
     assert "resource_blocks_v1" in ack.capabilities
+
+
+def test_batch_path_emits_one_retrieval_hash_read_and_result_span(
+    monkeypatch, tmp_path
+) -> None:
+    """W1a: the batch path emits one hash/read/result span when tracing is on."""
+    monkeypatch.setenv("DSV41_LW_V2_MASK_TRACE", "1")
+    monkeypatch.setenv("DSV41_LW_V2_MASK_TRACE_DIR", str(tmp_path))
+    lw_v3_trace.reset_for_tests()
+    try:
+        module, _ = _module()
+        key = _key(_tokens(TOKENS))
+        _store_chunk(module, key, 0)
+        result, stream = module.retrieve_resource_blocks(_request([_item(LONG_KV)]))
+    finally:
+        lw_v3_trace.reset_for_tests()
+
+    assert result.status == STATUS_OK, result
+    trace_path = tmp_path / f"mask-trace-{os.getpid()}.jsonl"
+    records = [json.loads(line) for line in trace_path.read_text().splitlines() if line]
+    retrieval_hashes = [
+        record
+        for record in records
+        if record["event"] == "server_hash" and record["purpose"] == "retrieval"
+    ]
+    events = [record["event"] for record in records]
+    assert len(retrieval_hashes) == 1
+    assert retrieval_hashes[0]["chunks"] == TOKENS // CHUNK
+    assert events.count("server_validate_batch") == 1
+    assert events.count("server_read") == 1
+    assert events.count("server_batch_result") == 1
+    assert stream
