@@ -38,6 +38,8 @@ from lmcache.v1.multiprocess.protocols.server_module import (
 )
 from lmcache.v1.multiprocess.resource_block_protocol import (
     ResourceBlockAck,
+    ResourceBlockBatchRequest,
+    ResourceBlockBatchResult,
     ResourceBlockLookupRequest,
     ResourceBlockLookupResult,
     ResourceBlockRegistration,
@@ -342,6 +344,11 @@ class RequestClient(Protocol):
     def retrieve_resource_block(
         self, spec: ResourceBlockSpec
     ) -> MessagingFuture[tuple[ResourceBlockResult, bytes]]: ...
+
+    @rpc_method
+    def retrieve_resource_blocks(
+        self, request: ResourceBlockBatchRequest
+    ) -> MessagingFuture[tuple[ResourceBlockBatchResult, bytes]]: ...
 
     @rpc_method
     def lookup_resource_blocks(

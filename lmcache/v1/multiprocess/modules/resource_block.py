@@ -17,6 +17,7 @@ lost index after a restart degrades to a miss, never to a wrong hit.
 """
 
 # Standard
+from collections.abc import Callable
 from dataclasses import dataclass, field
 import threading
 import time
@@ -40,6 +41,7 @@ from lmcache.v1.multiprocess.request_handler import HandlerType, request_handler
 from lmcache.v1.multiprocess.resource_block_protocol import (
     BOUNDARY_PAYLOAD_MAGIC,
     ERROR_ALREADY_PRESENT,
+    ERROR_CANCELLED,
     ERROR_INVALID_SPEC,
     ERROR_IO_ERROR,
     ERROR_LAYOUT_MISMATCH,
@@ -49,13 +51,22 @@ from lmcache.v1.multiprocess.resource_block_protocol import (
     ERROR_STALE_EPOCH,
     ERROR_STALE_GENERATION,
     ERROR_UNSUPPORTED_BOUNDARY_SCHEMA,
+    RESOURCE_BLOCK_BATCH_MAX_CHUNKS,
+    RESOURCE_BLOCK_BATCH_MAX_ITEMS,
+    RESOURCE_BLOCK_BATCH_MAX_TOTAL_BYTES,
     RESOURCE_BLOCK_CAPABILITIES,
     RESOURCE_BLOCK_PROTOCOL_VERSION,
     STATUS_FAILED,
+    STATUS_INVALID,
     STATUS_MISS,
     STATUS_OK,
+    STATUS_PARTIAL,
     TOKEN_PAYLOAD_MAGIC,
     ResourceBlockAck,
+    ResourceBlockBatchItem,
+    ResourceBlockBatchItemResult,
+    ResourceBlockBatchRequest,
+    ResourceBlockBatchResult,
     ResourceBlockLayout,
     ResourceBlockLookupRequest,
     ResourceBlockLookupResult,
@@ -167,9 +178,7 @@ class StockResourceBlockStore:
         """
         for manager in self._storage_manager.l1_managers():
             reserved = manager.reserve_read([key])
-            error, memory_obj = reserved.get(
-                key, (L1Error.KEY_NOT_EXIST, None)
-            )
+            error, memory_obj = reserved.get(key, (L1Error.KEY_NOT_EXIST, None))
             if error != L1Error.SUCCESS:
                 continue
             try:
@@ -179,6 +188,62 @@ class StockResourceBlockStore:
             finally:
                 manager.finish_read([key])
         return None
+
+    def read_many(
+        self,
+        keys: list[Any],
+        *,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> list[bytes | None]:
+        """Read several blocks, taking one batched read reservation per L1.
+
+        The read lock covers every key the manager granted and is released in
+        ``finally``, so a cancelled or failed batch cannot leak ``read_locked``
+        entries.  ``cancelled`` is a test seam for interrupting a batch between
+        payload copies; production callers leave it as ``None``.
+
+        Args:
+            keys: Ordered stock object keys to read.
+            cancelled: Optional predicate polled before each payload copy.
+
+        Returns:
+            One entry per key in input order; ``None`` for a key whose block is
+            not resident.
+
+        Raises:
+            _BatchCancelled: When ``cancelled`` reports an interruption.
+        """
+        results: list[bytes | None] = [None] * len(keys)
+        if not keys:
+            return results
+        for manager in self._storage_manager.l1_managers():
+            reserved = manager.reserve_read(list(keys))
+            granted = [
+                key
+                for key in keys
+                if reserved.get(key, (L1Error.KEY_NOT_EXIST, None))[0]
+                == L1Error.SUCCESS
+            ]
+            try:
+                for index, key in enumerate(keys):
+                    error, memory_obj = reserved.get(key, (L1Error.KEY_NOT_EXIST, None))
+                    if error != L1Error.SUCCESS:
+                        continue
+                    if cancelled is not None and cancelled():
+                        raise _BatchCancelled()
+                    if memory_obj is None or memory_obj.tensor is None:
+                        continue
+                    results[index] = (
+                        memory_obj.tensor.view(torch.uint8).numpy().tobytes()
+                    )
+            finally:
+                if granted:
+                    manager.finish_read(granted)
+        return results
+
+
+class _BatchCancelled(RuntimeError):
+    """A batch retrieve was cancelled between payload copies."""
 
 
 @dataclass
@@ -262,9 +327,7 @@ class ResourceBlockModule(DiscoverableModule):
     ) -> None:
         self._ctx = build_ctx.engine_context
         self._chunk_size = int(self._ctx.chunk_size)
-        self._store = block_store or StockResourceBlockStore(
-            self._ctx.storage_manager
-        )
+        self._store = block_store or StockResourceBlockStore(self._ctx.storage_manager)
         self._lock = threading.RLock()
         self._registrations: dict[str, _Registration] = {}
         self._completeness: dict[tuple, _Completeness] = {}
@@ -446,7 +509,9 @@ class ResourceBlockModule(DiscoverableModule):
             return self._result(spec, STATUS_FAILED, ERROR_PAYLOAD_CORRUPT)
         if magic == BOUNDARY_PAYLOAD_MAGIC:
             if expected_schema is None:
-                return self._result(spec, STATUS_FAILED, ERROR_UNSUPPORTED_BOUNDARY_SCHEMA)
+                return self._result(
+                    spec, STATUS_FAILED, ERROR_UNSUPPORTED_BOUNDARY_SCHEMA
+                )
             if header.get("schema") != 2:
                 return self._result(
                     spec, STATUS_FAILED, ERROR_UNSUPPORTED_BOUNDARY_SCHEMA
@@ -516,8 +581,7 @@ class ResourceBlockModule(DiscoverableModule):
             # A fanout stock key writes the same payload to every rank key, so
             # the block is only a duplicate when *every* rank already has it.
             if all(
-                marker in table.get((spec.resource_id, rank), set())
-                for rank in ranks
+                marker in table.get((spec.resource_id, rank), set()) for rank in ranks
             ):
                 # A duplicate store still proves this registration owns the
                 # object keys; keep the eviction index complete for it.
@@ -551,9 +615,7 @@ class ResourceBlockModule(DiscoverableModule):
                 # A deletion notification delivered at the end of the close
                 # window (after the counts were decremented) still sets a
                 # tombstone; re-read it here so it blocks publication.
-                raced_keys.update(
-                    key for key in keys if key in self._pending_deletions
-                )
+                raced_keys.update(key for key in keys if key in self._pending_deletions)
                 if not write_failed and not raced_keys:
                     completeness = self._completeness_for(state, spec.stock_key)
                     if resource.storage_kind == "boundary_state":
@@ -565,9 +627,7 @@ class ResourceBlockModule(DiscoverableModule):
                     # Record completeness for every rank the write covered: the
                     # stock lookup key has no worker id and requires all ranks.
                     for rank in ranks:
-                        table.setdefault((spec.resource_id, rank), set()).add(
-                            marker
-                        )
+                        table.setdefault((spec.resource_id, rank), set()).add(marker)
                     # Keep the reverse index so an L1 eviction/clear can retire
                     # the marker together with the object that backs it.  Token
                     # keys are shared by every registration that stored the
@@ -638,14 +698,116 @@ class ResourceBlockModule(DiscoverableModule):
         try:
             payload = self._store.read(keys[0])
         except Exception:  # noqa: BLE001 - surfaced as an IO failure result
-            logger.exception(
-                "resource-block retrieve failed for %s", spec.resource_id
-            )
+            logger.exception("resource-block retrieve failed for %s", spec.resource_id)
             return self._result(spec, STATUS_FAILED, ERROR_IO_ERROR), b""
         if payload is None:
             return self._result(spec, STATUS_MISS, ERROR_RESOURCE_MISSING), b""
         self._counters["blocks_retrieved"] += 1
         return self._result(spec, STATUS_OK, ""), payload
+
+    @request_handler(HandlerType.BLOCKING)
+    def retrieve_resource_blocks(
+        self, request: ResourceBlockBatchRequest
+    ) -> tuple[ResourceBlockBatchResult, bytes]:
+        """Return several stored block payloads in one round trip.
+
+        The batch shares one registration identity and one ``stock_key``: the
+        server validates the identity once, derives the stock chunk hashes
+        once and reads every accepted block through one batched L1 read
+        reservation.  Each item keeps the single-resource semantics, including
+        the single-kv-rank constraint, so a batch is only an aggregation of
+        otherwise valid ``retrieve_resource_block`` calls.
+
+        Partial outcomes are explicit: the top-level status is ``partial`` when
+        some items succeeded and ``ok`` only when all did.  An empty batch, a
+        stale identity or a request over the item/byte/chunk budget is rejected
+        as a batch-level error instead of silently returning nothing.
+
+        Args:
+            request: Shared identity, items and response byte budget.
+
+        Returns:
+            A ``(result, payload_stream)`` pair; ``result.items`` points into
+            ``payload_stream`` with ``offset``/``length``.
+        """
+        try:
+            state, ranks, chunk_hashes = self._validate_batch_request(request)
+        except _SpecError as error:
+            return self._batch_rejection(request, error.code), b""
+        keys: list[Any] = []
+        outcomes: list[ResourceBlockBatchItemResult | None] = [None] * len(
+            request.items
+        )
+        expected_bytes = 0
+        for index, item in enumerate(request.items):
+            try:
+                key = self._batch_item_key(item, request, state, ranks, chunk_hashes)
+            except _SpecError as error:
+                outcomes[index] = self._batch_item_result(
+                    item, STATUS_INVALID, error.code
+                )
+                continue
+            keys.append(key)
+            expected_bytes += state.layouts[item.resource_id].max_payload_bytes
+        if expected_bytes > request.max_total_bytes:
+            return self._batch_rejection(request, ERROR_INVALID_SPEC), b""
+        payloads: list[bytes | None] = []
+        if keys:
+            try:
+                payloads = self._store.read_many(keys)
+            except _BatchCancelled:
+                return self._batch_read_error(request, outcomes, ERROR_CANCELLED)
+            except Exception:  # noqa: BLE001 - surfaced as an IO failure result
+                logger.exception("resource-block batch retrieve failed")
+                return self._batch_read_error(request, outcomes, ERROR_IO_ERROR)
+        stream = bytearray()
+        results: list[ResourceBlockBatchItemResult] = []
+        payload_index = 0
+        retrieved = 0
+        for index, item in enumerate(request.items):
+            outcome = outcomes[index]
+            if outcome is not None:
+                results.append(outcome)
+                continue
+            payload = payloads[payload_index]
+            payload_index += 1
+            if payload is None:
+                results.append(
+                    self._batch_item_result(item, STATUS_MISS, ERROR_RESOURCE_MISSING)
+                )
+                continue
+            offset = len(stream)
+            stream.extend(payload)
+            retrieved += 1
+            results.append(
+                ResourceBlockBatchItemResult(
+                    operation_id=item.operation_id,
+                    resource_id=item.resource_id,
+                    engine_group_id=item.engine_group_id,
+                    start_token=item.start_token,
+                    end_token=item.end_token,
+                    prefix_end=item.prefix_end,
+                    status=STATUS_OK,
+                    offset=offset,
+                    length=len(payload),
+                )
+            )
+        if retrieved:
+            self._counters["blocks_retrieved"] += retrieved
+        return (
+            ResourceBlockBatchResult(
+                batch_id=request.batch_id,
+                instance_id=request.instance_id,
+                registration_epoch=request.registration_epoch,
+                server_generation=request.server_generation,
+                plan_hash=request.plan_hash,
+                layout_hash=request.layout_hash,
+                status=self._batch_status(results),
+                total_bytes=len(stream),
+                items=tuple(results),
+            ),
+            bytes(stream),
+        )
 
     @request_handler(HandlerType.BLOCKING)
     def lookup_resource_blocks(
@@ -806,6 +968,211 @@ class ResourceBlockModule(DiscoverableModule):
             raise _SpecError(ERROR_INVALID_SPEC)
         return state
 
+    def _validate_batch_request(
+        self, request: ResourceBlockBatchRequest
+    ) -> tuple[_Registration, list[Any], list[bytes]]:
+        """Validate the shared batch identity and return its derived state.
+
+        Runs before any block key is built or read: a stale registration,
+        wrong plan/layout, oversized stock key or malformed item list is
+        rejected as a batch-level error, so the caller never receives a
+        partially validated payload stream.  The returned chunk hashes are
+        computed exactly once for the whole batch.
+
+        Raises:
+            _SpecError: With the batch-level error code to report.
+        """
+        if not request.batch_id or not request.instance_id:
+            raise _SpecError(ERROR_INVALID_SPEC)
+        if not request.request_id:
+            raise _SpecError(ERROR_INVALID_SPEC)
+        if not request.items or len(request.items) > RESOURCE_BLOCK_BATCH_MAX_ITEMS:
+            raise _SpecError(ERROR_INVALID_SPEC)
+        if (
+            request.max_total_bytes <= 0
+            or request.max_total_bytes > RESOURCE_BLOCK_BATCH_MAX_TOTAL_BYTES
+        ):
+            raise _SpecError(ERROR_INVALID_SPEC)
+        seen_operations: set[str] = set()
+        seen_ranges: set[tuple[object, ...]] = set()
+        for item in request.items:
+            if not item.operation_id or item.operation_id in seen_operations:
+                raise _SpecError(ERROR_INVALID_SPEC)
+            seen_operations.add(item.operation_id)
+            identity = (
+                item.resource_id,
+                item.engine_group_id,
+                item.start_token,
+                item.end_token,
+                item.prefix_end,
+            )
+            if identity in seen_ranges:
+                raise _SpecError(ERROR_INVALID_SPEC)
+            seen_ranges.add(identity)
+            if item.skip_first_n_tokens < 0:
+                raise _SpecError(ERROR_INVALID_SPEC)
+        with self._lock:
+            state = self._registrations.get(request.instance_id)
+        if state is None:
+            raise _SpecError(ERROR_INVALID_SPEC)
+        registration = state.registration
+        if request.registration_epoch != registration.registration_epoch:
+            raise _SpecError(ERROR_STALE_EPOCH)
+        if request.server_generation != state.server_generation:
+            raise _SpecError(ERROR_STALE_GENERATION)
+        if request.plan_hash != registration.plan_hash:
+            raise _SpecError(ERROR_PLAN_MISMATCH)
+        if request.layout_hash != registration.layout_hash:
+            raise _SpecError(ERROR_LAYOUT_MISMATCH)
+        if request.stock_key.model_name != registration.model_name:
+            raise _SpecError(ERROR_INVALID_SPEC)
+        ranks = _lookup_kv_ranks(request.stock_key)
+        if len(ranks) != 1:
+            # The stock read reservation of one block must stay single-rank;
+            # aggregation across ranks remains the lookup's job.
+            raise _SpecError(ERROR_INVALID_SPEC)
+        end = int(request.stock_key.end)
+        token_count = len(request.stock_key.token_bytes) // 4
+        if end <= 0 or end > token_count:
+            raise _SpecError(ERROR_INVALID_SPEC)
+        chunk_size = int(self._chunk_size)
+        if chunk_size <= 0:
+            raise _SpecError(ERROR_INVALID_SPEC)
+        chunks = (end + chunk_size - 1) // chunk_size
+        if chunks <= 0 or chunks > RESOURCE_BLOCK_BATCH_MAX_CHUNKS:
+            raise _SpecError(ERROR_INVALID_SPEC)
+        return state, ranks, self._chunk_hashes(request.stock_key)
+
+    def _batch_item_key(
+        self,
+        item: ResourceBlockBatchItem,
+        request: ResourceBlockBatchRequest,
+        state: _Registration,
+        ranks: list[Any],
+        chunk_hashes: list[bytes],
+    ) -> Any:
+        """Build the stock object key of one batch item.
+
+        Raises:
+            _SpecError: When the item does not describe a readable block.
+        """
+        resource = state.resources.get(item.resource_id)
+        if resource is None or resource.storage_kind == "recompute":
+            raise _SpecError(ERROR_INVALID_SPEC)
+        if item.engine_group_id != resource.engine_group_id:
+            raise _SpecError(ERROR_INVALID_SPEC)
+        chunk_size = int(self._chunk_size)
+        if resource.storage_kind == "boundary_state":
+            if item.prefix_end <= 0 or item.prefix_end % chunk_size:
+                raise _SpecError(ERROR_INVALID_SPEC)
+            index = item.prefix_end // chunk_size - 1
+            if index < 0 or index >= len(chunk_hashes):
+                raise _SpecError(ERROR_INVALID_SPEC)
+            return self._boundary_object_keys(
+                stock_key=request.stock_key,
+                plan_hash=request.plan_hash,
+                layout_hash=request.layout_hash,
+                resource_id=item.resource_id,
+                prefix_end=item.prefix_end,
+                instance_id=request.instance_id,
+                ranks=ranks,
+                chunk_hashes=chunk_hashes,
+            )[0]
+        if item.start_token % chunk_size:
+            raise _SpecError(ERROR_INVALID_SPEC)
+        if item.end_token - item.start_token != chunk_size:
+            raise _SpecError(ERROR_INVALID_SPEC)
+        index = item.start_token // chunk_size
+        if index < 0 or index >= len(chunk_hashes):
+            raise _SpecError(ERROR_INVALID_SPEC)
+        return resource_block_object_keys(
+            request.stock_key,
+            chunk_hashes[index],
+            plan_hash=request.plan_hash,
+            layout_hash=request.layout_hash,
+            resource_id=item.resource_id,
+            ranks=ranks,
+        )[0]
+
+    def _batch_item_result(
+        self,
+        item: ResourceBlockBatchItem,
+        status: str,
+        error_code: str,
+    ) -> ResourceBlockBatchItemResult:
+        """Echo one item's identity together with a terminal status."""
+        return ResourceBlockBatchItemResult(
+            operation_id=item.operation_id,
+            resource_id=item.resource_id,
+            engine_group_id=item.engine_group_id,
+            start_token=item.start_token,
+            end_token=item.end_token,
+            prefix_end=item.prefix_end,
+            status=status,
+            error_code=error_code,
+        )
+
+    def _batch_status(self, results: list[ResourceBlockBatchItemResult]) -> str:
+        """Aggregate per-item statuses into the batch outcome."""
+        statuses = [result.status for result in results]
+        if not statuses:
+            return STATUS_INVALID
+        if all(status == STATUS_OK for status in statuses):
+            return STATUS_OK
+        if any(status == STATUS_OK for status in statuses):
+            return STATUS_PARTIAL
+        if all(status == STATUS_MISS for status in statuses):
+            return STATUS_MISS
+        if all(status == STATUS_INVALID for status in statuses):
+            return STATUS_INVALID
+        return STATUS_FAILED
+
+    def _batch_rejection(
+        self, request: ResourceBlockBatchRequest, error_code: str
+    ) -> ResourceBlockBatchResult:
+        """Report a batch-level validation error with no payload stream."""
+        status = STATUS_INVALID if error_code == ERROR_INVALID_SPEC else STATUS_FAILED
+        return ResourceBlockBatchResult(
+            batch_id=request.batch_id,
+            instance_id=request.instance_id,
+            registration_epoch=request.registration_epoch,
+            server_generation=request.server_generation,
+            plan_hash=request.plan_hash,
+            layout_hash=request.layout_hash,
+            status=status,
+            error_code=error_code,
+        )
+
+    def _batch_read_error(
+        self,
+        request: ResourceBlockBatchRequest,
+        outcomes: list[ResourceBlockBatchItemResult | None],
+        error_code: str,
+    ) -> tuple[ResourceBlockBatchResult, bytes]:
+        """Mark every readable item with a batch read failure."""
+        results = []
+        for index, item in enumerate(request.items):
+            outcome = outcomes[index]
+            results.append(
+                outcome
+                if outcome is not None
+                else self._batch_item_result(item, STATUS_FAILED, error_code)
+            )
+        return (
+            ResourceBlockBatchResult(
+                batch_id=request.batch_id,
+                instance_id=request.instance_id,
+                registration_epoch=request.registration_epoch,
+                server_generation=request.server_generation,
+                plan_hash=request.plan_hash,
+                layout_hash=request.layout_hash,
+                status=STATUS_FAILED,
+                error_code=error_code,
+                items=tuple(results),
+            ),
+            b"",
+        )
+
     def _open_store_window(self, keys: list[Any]) -> None:
         """Register in-flight object keys before their payload becomes visible.
 
@@ -816,9 +1183,7 @@ class ResourceBlockModule(DiscoverableModule):
         dropped.
         """
         for key in keys:
-            self._pending_store_counts[key] = (
-                self._pending_store_counts.get(key, 0) + 1
-            )
+            self._pending_store_counts[key] = self._pending_store_counts.get(key, 0) + 1
 
     def _close_store_window(self, keys: list[Any]) -> set[Any]:
         """Close the in-flight window and return keys deleted during it.
@@ -998,9 +1363,7 @@ class ResourceBlockModule(DiscoverableModule):
                 break
             if boundary_resources and not all(
                 (endpoint, chunk_hash)
-                in completeness.boundaries.get(
-                    (resource.resource_id, rank), set()
-                )
+                in completeness.boundaries.get((resource.resource_id, rank), set())
                 for resource in boundary_resources
                 for rank in ranks
             ):
@@ -1013,13 +1376,36 @@ class ResourceBlockModule(DiscoverableModule):
             key.token_bytes, end=key.end
         )
 
-    def _boundary_keys(
-        self, spec: ResourceBlockSpec, ranks: list[int]
-    ) -> list[Any]:
+    def _boundary_keys(self, spec: ResourceBlockSpec, ranks: list[int]) -> list[Any]:
         if spec.prefix_end <= 0 or spec.prefix_end % self._chunk_size:
             raise _SpecError(ERROR_INVALID_SPEC)
         chunk_hashes = self._chunk_hashes(spec.stock_key)
-        chunk_index = spec.prefix_end // self._chunk_size - 1
+        return self._boundary_object_keys(
+            stock_key=spec.stock_key,
+            plan_hash=spec.plan_hash,
+            layout_hash=spec.layout_hash,
+            resource_id=spec.resource_id,
+            prefix_end=spec.prefix_end,
+            instance_id=spec.instance_id,
+            ranks=ranks,
+            chunk_hashes=chunk_hashes,
+        )
+
+    def _boundary_object_keys(
+        self,
+        *,
+        stock_key: "IPCCacheServerKey",
+        plan_hash: str,
+        layout_hash: str,
+        resource_id: str,
+        prefix_end: int,
+        instance_id: str,
+        ranks: list[Any],
+        chunk_hashes: list[bytes],
+    ) -> list[Any]:
+        if prefix_end <= 0 or prefix_end % self._chunk_size:
+            raise _SpecError(ERROR_INVALID_SPEC)
+        chunk_index = prefix_end // self._chunk_size - 1
         if chunk_index < 0 or chunk_index >= len(chunk_hashes):
             raise _SpecError(ERROR_INVALID_SPEC)
         # Compressor boundary state is rank-local: every TP rank keeps its
@@ -1029,13 +1415,11 @@ class ResourceBlockModule(DiscoverableModule):
         # cannot overwrite or fail each other's capture; the retrieve path uses
         # the same registration id and therefore reads back its own bytes.
         return resource_block_object_keys(
-            spec.stock_key,
+            stock_key,
             chunk_hashes[chunk_index],
-            plan_hash=spec.plan_hash,
-            layout_hash=spec.layout_hash,
-            resource_id=(
-                f"{spec.resource_id}@{spec.prefix_end}@{spec.instance_id}"
-            ),
+            plan_hash=plan_hash,
+            layout_hash=layout_hash,
+            resource_id=f"{resource_id}@{prefix_end}@{instance_id}",
             ranks=ranks,
         )
 

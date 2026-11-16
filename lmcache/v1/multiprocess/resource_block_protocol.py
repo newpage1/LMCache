@@ -35,14 +35,25 @@ RESOURCE_BLOCK_CAPABILITIES = (
     "resource_blocks_v1",
     "stock_prefix_visibility_v1",
     "boundary_schema2",
+    "resource_blocks_batch_v1",
 )
 
 RESOURCE_BLOCK_ENCODINGS = ("token_range_v1", "boundary_schema2")
+
+#: Hard limits for one batch retrieve round trip.  The item cap and the byte
+#: budget bound the response size; the chunk cap bounds how many token hashes
+#: the server is willing to derive from one ``stock_key`` (a caller-controlled
+#: token span must not turn into unbounded hashing work).
+RESOURCE_BLOCK_BATCH_MAX_ITEMS = 64
+RESOURCE_BLOCK_BATCH_MAX_TOTAL_BYTES = 64 * 1024 * 1024
+RESOURCE_BLOCK_BATCH_MAX_CHUNKS = 1 << 16
 
 STATUS_OK = "ok"
 STATUS_MISS = "miss"
 STATUS_INVALID = "invalid"
 STATUS_FAILED = "failed"
+#: Mixed batch outcome: some items succeeded and some did not.
+STATUS_PARTIAL = "partial"
 
 ERROR_ALREADY_PRESENT = "ALREADY_PRESENT"
 ERROR_RESOURCE_MISSING = "RESOURCE_MISSING"
@@ -182,6 +193,96 @@ class ResourceBlockLookupResult:
     prefix_end: int
     token_prefix_end: int
     boundary_prefix_end: int
+
+
+@dataclass(frozen=True)
+class ResourceBlockBatchItem:
+    """One block inside a batch retrieve.
+
+    The batch carries the shared registration/spec identity once, so an item
+    only names the resource and the chunk it wants.  ``skip_first_n_tokens``
+    and ``boundary`` are part of the wire contract for adapter symmetry; the
+    retrieve path does not consume them and callers pass the defaults
+    (``0`` / ``None``).
+    """
+
+    operation_id: str
+    resource_id: str
+    engine_group_id: int | None
+    block_ids: tuple[int, ...]
+    start_token: int
+    end_token: int
+    prefix_end: int
+    skip_first_n_tokens: int = 0
+    boundary: dict[str, object] | None = None
+
+
+@dataclass(frozen=True)
+class ResourceBlockBatchRequest:
+    """Retrieve several resource blocks with one stock prefix hash.
+
+    Attributes:
+        batch_id: Client-chosen identity echoed back by the server.
+        instance_id: Registration the batch is validated against.
+        request_id: Transfer request the batch belongs to.
+        step_id: Transfer step the batch belongs to.
+        registration_epoch: Expected registration epoch.
+        server_generation: Expected registration generation.
+        plan_hash: Expected transfer plan namespace.
+        layout_hash: Expected cache layout namespace.
+        stock_key: Shared stock cache key (token identity + salt/model).
+        items: Ordered blocks; a resource may appear again for another chunk.
+        max_total_bytes: Response budget for the concatenated payload bytes.
+    """
+
+    batch_id: str
+    instance_id: str
+    request_id: str
+    step_id: int
+    registration_epoch: int
+    server_generation: int
+    plan_hash: str
+    layout_hash: str
+    stock_key: IPCCacheServerKey
+    items: tuple[ResourceBlockBatchItem, ...]
+    max_total_bytes: int = RESOURCE_BLOCK_BATCH_MAX_TOTAL_BYTES
+
+
+@dataclass(frozen=True)
+class ResourceBlockBatchItemResult:
+    """Per-item outcome with the byte slice inside the response payload."""
+
+    operation_id: str
+    resource_id: str
+    engine_group_id: int | None
+    start_token: int
+    end_token: int
+    prefix_end: int
+    status: str
+    error_code: str = ""
+    offset: int = 0
+    length: int = 0
+
+
+@dataclass(frozen=True)
+class ResourceBlockBatchResult:
+    """Batch outcome plus the concatenated payload stream.
+
+    ``status`` is ``"ok"`` only when every item succeeded, ``"partial"`` when
+    some did, and a single miss/invalid/failed code otherwise.  ``error_code``
+    is set for batch-level rejections (empty batch, stale identity, budget).
+    """
+
+    batch_id: str
+    instance_id: str
+    registration_epoch: int
+    server_generation: int
+    plan_hash: str
+    layout_hash: str
+    status: str
+    error_code: str = ""
+    total_bytes: int = 0
+    items: tuple[ResourceBlockBatchItemResult, ...] = ()
 
 
 def resource_block_chunk_hash(
